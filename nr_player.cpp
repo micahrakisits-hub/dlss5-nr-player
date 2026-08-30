@@ -1,0 +1,1259 @@
+// nr_player.cpp - DLSS 5 Neural Rendering VIDEO PLAYER.
+// ffmpeg (subprocess, CPU decode) -> raw RGBA pipe -> upload -> cs1(RGBA8->RGBA16F)
+// -> NGX NR feature 18 -> cs2(RGBA16F->RGBA8, R/B swap) -> RGBA8 swapchain window.
+// All textures RGBA (B8G8R8A8 has NO UAV support in D3D12 — that was the color bug).
+//
+// Usage: nr_player.exe <video> [--gpu N] [--style ...] [--preset ...] ... [--fast]
+// Press ESC in the window to exit.
+//
+// Build: cl /nologo /EHsc /O2 /MT nr_player.cpp /link /OUT:nr_player.exe
+//        d3d12.lib dxgi.lib d3dcompiler.lib user32.lib
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#ifndef NVSDK_CONV
+#define NVSDK_CONV __cdecl
+#endif
+#include <windows.h>
+#include <mmsystem.h>
+#include <commctrl.h>
+#include <d3d12.h>
+#include <dxgi1_5.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstdarg>
+#include <string>
+#include <vector>
+#include <cstring>
+#include <algorithm>
+
+using Microsoft::WRL::ComPtr;
+
+// forward-declared (we never touch D3D11; only the NGX vtable signature needs it)
+struct ID3D11Resource;
+
+// ---------------------------------------------------------------------------
+// NGX interface (inline vtable, mirrors NVIDIA's layout)
+// ---------------------------------------------------------------------------
+typedef int NVSDK_NGX_Result;
+static const NVSDK_NGX_Result NGX_SUCCESS = 1;
+
+struct NVSDK_NGX_Handle { unsigned int Id; };
+
+struct NVSDK_NGX_Parameter
+{
+    virtual void Set(const char *InName, unsigned long long InValue) = 0;
+    virtual void Set(const char *InName, float InValue) = 0;
+    virtual void Set(const char *InName, double InValue) = 0;
+    virtual void Set(const char *InName, unsigned int InValue) = 0;
+    virtual void Set(const char *InName, int InValue) = 0;
+    virtual void Set(const char *InName, ID3D11Resource *InValue) = 0;
+    virtual void Set(const char *InName, ID3D12Resource *InValue) = 0;
+    virtual void Set(const char *InName, void *InValue) = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, unsigned long long *OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, float *OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, double *OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, unsigned int *OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, int *OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, ID3D11Resource **OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, ID3D12Resource **OutValue) const = 0;
+    virtual NVSDK_NGX_Result Get(const char *InName, void **OutValue) const = 0;
+    virtual void Reset() = 0;
+};
+
+typedef struct NVSDK_NGX_PathListInfo
+{
+    wchar_t const *const *Path;
+    unsigned int Length;
+} NVSDK_NGX_PathListInfo;
+
+typedef enum NVSDK_NGX_Logging_Level
+{
+    NVSDK_NGX_LOGGING_LEVEL_OFF = 0,
+    NVSDK_NGX_LOGGING_LEVEL_ON,
+    NVSDK_NGX_LOGGING_LEVEL_VERBOSE,
+} NVSDK_NGX_Logging_Level;
+
+typedef void(NVSDK_CONV *NVSDK_NGX_AppLogCallback)(const char *, NVSDK_NGX_Logging_Level, int);
+
+typedef struct NVSDK_NGX_LoggingInfo
+{
+    NVSDK_NGX_Logging_Level LoggingLevel;
+    NVSDK_NGX_AppLogCallback Callback;
+    void *UserData;
+    bool DisableOtherLoggingSinks;
+} NVSDK_NGX_LoggingInfo;
+
+typedef struct NVSDK_NGX_FeatureCommonInfo_Internal NVSDK_NGX_FeatureCommonInfo_Internal;
+
+typedef struct NVSDK_NGX_FeatureCommonInfo
+{
+    NVSDK_NGX_PathListInfo PathListInfo;
+    NVSDK_NGX_FeatureCommonInfo_Internal *InternalData;
+    NVSDK_NGX_LoggingInfo LoggingInfo;
+} NVSDK_NGX_FeatureCommonInfo;
+
+typedef NVSDK_NGX_Result (*PFN_Init_Ext)(unsigned long long, const wchar_t *, ID3D12Device *, int, const void *);
+typedef NVSDK_NGX_Result (*PFN_Init_ProjectID)(const char *, int, const char *, const wchar_t *, ID3D12Device *, int, const void *);
+typedef NVSDK_NGX_Result (*PFN_ShimInit)(void *, unsigned long long, const wchar_t *, ID3D12Device *, int, const void *);
+typedef NVSDK_NGX_Result (*PFN_ShimCreate)(void *, ID3D12GraphicsCommandList *, int, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
+typedef NVSDK_NGX_Result (*PFN_ShimEvaluate)(void *, ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, void *);
+typedef NVSDK_NGX_Result (*PFN_ShimRelease)(void *, NVSDK_NGX_Handle *);
+typedef NVSDK_NGX_Result (*PFN_ShimShutdown)(void *);
+typedef NVSDK_NGX_Result (*PFN_AllocateParameters)(NVSDK_NGX_Parameter **);
+typedef NVSDK_NGX_Result (*PFN_D3D12CreateFeature)(ID3D12GraphicsCommandList *, int, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
+typedef NVSDK_NGX_Result (*PFN_D3D12EvaluateFeature)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, void *);
+typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
+typedef NVSDK_NGX_Result (*PFN_Shutdown)(void);
+
+static const int NR_FEATURE_ID = 18;
+
+// ---------------------------------------------------------------------------
+// globals
+// ---------------------------------------------------------------------------
+static PFN_Init_Ext            g_init_ext;
+static PFN_Init_ProjectID      g_init_projectid;
+static PFN_AllocateParameters  g_alloc;
+static PFN_D3D12CreateFeature  g_create;
+static PFN_D3D12EvaluateFeature g_eval;
+static PFN_D3D12ReleaseFeature g_release;
+static PFN_Shutdown            g_shutdown;
+static PFN_Init_Ext            g_direct_init;
+static PFN_D3D12CreateFeature  g_nr_create;
+static PFN_D3D12EvaluateFeature g_nr_eval;
+static PFN_D3D12ReleaseFeature g_nr_release;
+static PFN_ShimInit            g_shim_init;
+static PFN_ShimCreate          g_shim_create;
+static PFN_ShimEvaluate        g_shim_eval;
+static PFN_ShimRelease         g_shim_release;
+
+static ComPtr<IDXGIFactory1>            g_factory;
+static ComPtr<IDXGIFactory2>            g_factory2;
+static ComPtr<ID3D12Device>             g_dev;
+static ComPtr<ID3D12CommandQueue>       g_queue;
+static ComPtr<ID3D12GraphicsCommandList> g_list;
+static const int                        FRAMES_IN_FLIGHT = 2;
+static ComPtr<ID3D12CommandAllocator>   g_cmd_alloc[FRAMES_IN_FLIGHT];
+static ComPtr<ID3D12Fence>              g_fence[FRAMES_IN_FLIGHT];
+static UINT64                           g_fence_value[FRAMES_IN_FLIGHT];
+static UINT                             g_frame_slot = 0;
+static ComPtr<ID3D12Fence>              g_sync_fence;
+static UINT64                           g_sync_value = 0;
+
+static NVSDK_NGX_Parameter *g_params = nullptr;
+static NVSDK_NGX_Handle    *g_feature = nullptr;
+
+static ComPtr<ID3D12Resource> g_y_tex;       // R8_UNORM Y plane (W x H)
+static ComPtr<ID3D12Resource> g_uv_tex;      // R8G8_UNORM UV plane (W/2 x H/2)
+static ComPtr<ID3D12Resource> g_staging;     // UPLOAD heap: Y (padded) + UV (padded)
+static ComPtr<ID3D12Resource> g_nr_in;       // R16G16B16A16_FLOAT NR input
+static ComPtr<ID3D12Resource> g_nr_out;      // R16G16B16A16_FLOAT NR output
+static ComPtr<ID3D12Resource> g_stage_rgba;  // R8G8B8A8 NR output (cs2 UAV)
+static ComPtr<ID3D12Resource> g_orig_rgba;   // R8G8B8A8 "original" (side-by-side left)
+static ComPtr<ID3D12DescriptorHeap> g_cbv_heap;
+
+static ComPtr<ID3D12RootSignature> g_rs;
+static ComPtr<ID3D12PipelineState> g_pso_in;   // RGBA8 -> RGBA16F
+static ComPtr<ID3D12PipelineState> g_pso_out;  // RGBA16F -> RGBA8 (R/B swap)
+
+static ComPtr<IDXGISwapChain3> g_swap;
+static HWND g_hwnd = nullptr;
+
+static UINT g_vid_w = 0, g_vid_h = 0;
+static UINT g_row_pitch = 0;
+static double g_fps = 30.0;
+static int  g_gpu_index = -1;
+static std::string g_style = "natural";
+static int  g_preset = 3, g_intensity = 1, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
+static bool g_fast = false;
+static bool g_side = true;   // side-by-side: original | NR (default)
+static UINT64 g_frame_index = 0;
+static std::wstring g_dump_path;
+static std::wstring g_output;      // offline output file (empty = playback only)
+static int g_crf = 18;             // x264 CRF for offline output
+static HANDLE g_enc_write = nullptr, g_enc_proc = nullptr;
+static UINT g_last_slot = 0;
+static ComPtr<ID3D12Resource> g_readback;
+
+static HANDLE g_audio_read = nullptr;
+static HANDLE g_audio_thread = nullptr;
+static volatile bool g_audio_done = false;
+
+// seek / progress bar state
+static double g_duration = 0.0;      // video duration (seconds)
+static double g_base_time = 0.0;     // seek offset (seconds)
+static volatile double g_seek_to = 0.0;
+static volatile bool g_seek_requested = false;
+static bool g_dragging = false;
+static ULONGLONG g_last_seek_tick = 0;
+static HWND g_trackbar = nullptr;
+static HANDLE g_ffread = nullptr, g_ffproc = nullptr, g_afproc = nullptr;
+
+// timing instrumentation (ms)
+static double g_read_ms = 0, g_wait_ms = 0, g_upload_ms = 0;
+
+static volatile bool g_running = true;
+
+// ---------------------------------------------------------------------------
+// logging
+// ---------------------------------------------------------------------------
+static void Log(const char *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap); fprintf(stderr, "\n");
+    va_end(ap);
+}
+static void Fatal(const char *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap); fprintf(stderr, "\n");
+    va_end(ap);
+    ExitProcess(1);
+}
+
+static D3D12_RESOURCE_BARRIER Trans(ID3D12Resource *res, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
+{
+    D3D12_RESOURCE_BARRIER x = {};
+    x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    x.Transition.pResource = res;
+    x.Transition.StateBefore = a;
+    x.Transition.StateAfter = b;
+    return x;
+}
+
+static void WaitFence(ID3D12Fence *f, UINT64 v)
+{
+    if (f->GetCompletedValue() < v)
+    {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        f->SetEventOnCompletion(v, ev);
+        WaitForSingleObject(ev, 20000);
+        CloseHandle(ev);
+    }
+}
+
+static void ExecuteAndWait()
+{
+    g_list->Close();
+    ID3D12CommandList *cmds[] = { g_list.Get() };
+    g_queue->ExecuteCommandLists(1, cmds);
+    g_queue->Signal(g_sync_fence.Get(), ++g_sync_value);
+    WaitFence(g_sync_fence.Get(), g_sync_value);
+}
+
+// ---------------------------------------------------------------------------
+// D3D12 device (--gpu N)
+// ---------------------------------------------------------------------------
+static bool CreateDevice()
+{
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&g_factory)))) return false;
+    g_factory.As(&g_factory2);
+    ComPtr<IDXGIAdapter1> adapter;
+    int sel = -1;
+    for (UINT i = 0; g_factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i)
+    {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter->GetDesc1(&desc);
+        Log("GPU[%d]: %ls (vendor=0x%04X VRAM=%u MB)", i, desc.Description, desc.VendorId, (unsigned)(desc.DedicatedVideoMemory >> 20));
+        if (g_gpu_index < 0) { if (sel < 0 && desc.VendorId == 0x10DE) sel = (int)i; }
+        else if (g_gpu_index == (int)i) sel = (int)i;
+        adapter.Reset();
+    }
+    if (sel < 0) sel = 0;
+    ComPtr<IDXGIAdapter1> chosen;
+    g_factory->EnumAdapters1(sel, &chosen);
+    if (FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dev))))
+        { Log("FAIL: D3D12CreateDevice"); return false; }
+    Log("D3D12 adapter: index %d", sel);
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)))) return false;
+    for (int i = 0; i < FRAMES_IN_FLIGHT; ++i)
+    {
+        if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_cmd_alloc[i])))) return false;
+        if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence[i])))) return false;
+    }
+    if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_cmd_alloc[0].Get(), nullptr, IID_PPV_ARGS(&g_list)))) return false;
+    if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_sync_fence)))) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// textures
+// ---------------------------------------------------------------------------
+static ComPtr<ID3D12Resource> MakeTex(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_STATES st, D3D12_RESOURCE_FLAGS flags)
+{
+    D3D12_RESOURCE_DESC d = {};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = w; d.Height = h; d.DepthOrArraySize = 1;
+    d.MipLevels = 1; d.Format = fmt; d.SampleDesc.Count = 1;
+    d.Flags = flags;
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ComPtr<ID3D12Resource> r;
+    if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, st, nullptr, IID_PPV_ARGS(&r))))
+        return nullptr;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// NGX init (Init_ProjectID + shim + snippet, feature 18)
+// ---------------------------------------------------------------------------
+static bool SetupNGX(UINT w, UINT h)
+{
+    HMODULE ngx = LoadLibraryW(L"_nvngx.dll");
+    if (!ngx)
+    {
+        WIN32_FIND_DATAW fd;
+        wchar_t pat[MAX_PATH];
+        swprintf_s(pat, L"%ls\\FileRepository\\nv_dispi.inf_*\\_nvngx.dll", L"C:\\Windows\\System32\\DriverStore");
+        HANDLE hf = FindFirstFileW(pat, &fd);
+        if (hf != INVALID_HANDLE_VALUE)
+        {
+            wchar_t full[MAX_PATH];
+            swprintf_s(full, L"C:\\Windows\\System32\\DriverStore\\FileRepository\\%ls", fd.cFileName);
+            ngx = LoadLibraryW(full);
+            FindClose(hf);
+        }
+    }
+    if (!ngx) { Log("FAIL: cannot load _nvngx.dll"); return false; }
+    g_init_ext       = (PFN_Init_Ext)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_Ext");
+    g_init_projectid = (PFN_Init_ProjectID)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID");
+    g_alloc          = (PFN_AllocateParameters)GetProcAddress(ngx, "NVSDK_NGX_D3D12_AllocateParameters");
+    g_create         = (PFN_D3D12CreateFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_CreateFeature");
+    g_eval           = (PFN_D3D12EvaluateFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature");
+    g_release        = (PFN_D3D12ReleaseFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_ReleaseFeature");
+    g_shutdown       = (PFN_Shutdown)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Shutdown");
+
+    HMODULE nr = LoadLibraryW(L"nvngx_dlssnr.dll");
+    if (!nr) { Log("FAIL: cannot load nvngx_dlssnr.dll"); return false; }
+    g_direct_init = (PFN_Init_Ext)GetProcAddress(nr, "NVSDK_NGX_D3D12_Init_Ext");
+    g_nr_create   = (PFN_D3D12CreateFeature)GetProcAddress(nr, "NVSDK_NGX_D3D12_CreateFeature");
+    g_nr_eval     = (PFN_D3D12EvaluateFeature)GetProcAddress(nr, "NVSDK_NGX_D3D12_EvaluateFeature");
+    g_nr_release  = (PFN_D3D12ReleaseFeature)GetProcAddress(nr, "NVSDK_NGX_D3D12_ReleaseFeature");
+
+    HMODULE shim = LoadLibraryW(L"caller\\nvngx.dll");
+    if (shim)
+    {
+        g_shim_init    = (PFN_ShimInit)GetProcAddress(shim, "DLSSNR_CallInit");
+        g_shim_create  = (PFN_ShimCreate)GetProcAddress(shim, "DLSSNR_CallCreate");
+        g_shim_eval    = (PFN_ShimEvaluate)GetProcAddress(shim, "DLSSNR_CallEvaluate");
+        g_shim_release = (PFN_ShimRelease)GetProcAddress(shim, "DLSSNR_CallRelease");
+    }
+    if (!g_init_projectid || !g_alloc || !g_nr_create || !g_nr_eval || !g_nr_release)
+        { Log("FAIL: NGX entry points missing"); return false; }
+
+    wchar_t data_path[MAX_PATH] = L".";
+    GetCurrentDirectoryW(MAX_PATH, data_path);
+    const unsigned long long APP_ID = 141959980ULL;
+    const wchar_t *path_list[1] = { data_path };
+    NVSDK_NGX_PathListInfo pli = {}; pli.Path = path_list; pli.Length = 1;
+    NVSDK_NGX_FeatureCommonInfo fci = {};
+    fci.PathListInfo = pli;
+    fci.LoggingInfo.LoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
+
+    int inited = 0;
+    for (int ver = 0x13; ver <= 0x20 && !inited; ++ver)
+    {
+        NVSDK_NGX_Result r = g_init_projectid("53f803cc-a12f-4d69-90d5-19b7599cad19",
+                                              0, "0.1", data_path, g_dev.Get(), ver, nullptr);
+        if (r == NGX_SUCCESS) { Log("core Init_ProjectID ver=0x%02X ok", ver); inited = 1; }
+    }
+    if (!inited) { Log("FAIL: Init_ProjectID"); return false; }
+
+    if (g_direct_init && g_shim_init)
+    {
+        NVSDK_NGX_Result r = g_shim_init((void *)g_direct_init, APP_ID, data_path, g_dev.Get(), 0x15, &fci);
+        Log("snippet Init_Ext (via shim) -> 0x%08X", (unsigned)r);
+    }
+
+    NVSDK_NGX_Result ra = g_alloc(&g_params);
+    if (ra != NGX_SUCCESS || !g_params) { Log("FAIL: AllocateParameters"); return false; }
+
+    int style_int = 1;
+    if (g_style == "default") style_int = 0;
+    else if (g_style == "natural") style_int = 1;
+    else if (g_style == "cinematic") style_int = 2;
+    else style_int = atoi(g_style.c_str());
+
+    g_params->Set("DLSSNR.Width", w);
+    g_params->Set("DLSSNR.Height", h);
+    g_params->Set("DLSSNR.Enabled", 1);
+    g_params->Set("DLSSNR.Reset", 1);
+    g_params->Set("DLSSNR.Style", style_int);
+    g_params->Set("DLSSNR.Hint.Render.Preset", g_preset);
+    g_params->Set("DLSSNR.Intensity", (float)g_intensity);
+    g_params->Set("DLSSNR.LocalToneStrength", (float)g_tone);
+    g_params->Set("DLSSNR.LocalStructureStrength", (float)g_structure);
+    g_params->Set("DLSSNR.SkinStructureStrength", (float)g_skin);
+    g_params->Set("DLSSNR.UseAutoMask", g_mask);
+    g_params->Set("DLSSNR.UICorrection", 0);
+    g_params->Set("DLSSNR.DepthInverted", 1);
+    g_params->Set("DLSSNR.ScalingRatio", 1.0f);
+    g_params->Set("DLSSNR.MVecScaleX", 1.0f);
+    g_params->Set("DLSSNR.MVecScaleY", 1.0f);
+    g_params->Set("DLSSNR.Color", g_nr_in.Get());
+    g_params->Set("DLSSNR.Output", g_nr_out.Get());
+    g_params->Set("DLSSNR.Backbuffer", g_nr_out.Get());
+    g_params->Set("DLSSNR.ColorSubrectBaseX", 0);
+    g_params->Set("DLSSNR.ColorSubrectBaseY", 0);
+    g_params->Set("DLSSNR.ColorSubrectWidth", w);
+    g_params->Set("DLSSNR.ColorSubrectHeight", h);
+    g_params->Set("DLSSNR.OutputSubrectBaseX", 0);
+    g_params->Set("DLSSNR.OutputSubrectBaseY", 0);
+    g_params->Set("DLSSNR.OutputSubrectWidth", w);
+    g_params->Set("DLSSNR.OutputSubrectHeight", h);
+
+    if (g_nr_create && g_shim_create)
+    {
+        NVSDK_NGX_Result rc = g_shim_create((void *)g_nr_create, g_list.Get(), NR_FEATURE_ID, g_params, &g_feature);
+        if (rc != NGX_SUCCESS || !g_feature)
+            { Log("FAIL: CreateFeature(18) via shim -> 0x%08X", (unsigned)rc); return false; }
+    }
+    else
+    {
+        NVSDK_NGX_Result rc = g_create(g_list.Get(), NR_FEATURE_ID, g_params, &g_feature);
+        if (rc != NGX_SUCCESS || !g_feature)
+            { Log("FAIL: CreateFeature(18) -> 0x%08X", (unsigned)rc); return false; }
+    }
+    Log("NR feature created, handle=%p", g_feature);
+    ExecuteAndWait();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// compute shaders + descriptor heap
+// ---------------------------------------------------------------------------
+static bool SetupCompute()
+{
+    // root signature: 4 descriptor tables (SRV t0, SRV t1, UAV u0, UAV u1)
+    D3D12_DESCRIPTOR_RANGE ranges[4] = {};
+    for (int i = 0; i < 4; ++i)
+    {
+        ranges[i].RangeType = (i < 2) ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[i].NumDescriptors = 1;
+        ranges[i].BaseShaderRegister = (i < 2) ? i : (i - 2);
+    }
+    D3D12_ROOT_PARAMETER rp[4] = {};
+    for (int i = 0; i < 4; ++i)
+    {
+        rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[i].DescriptorTable.NumDescriptorRanges = 1;
+        rp[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+    }
+
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 4; rsd.pParameters = rp;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    ComPtr<ID3DBlob> sig, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)))
+        { Log("FAIL: serialize root sig"); return false; }
+    if (FAILED(g_dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rs))))
+        { Log("FAIL: CreateRootSignature"); return false; }
+
+    // cs0: NV12 -> RGBA16F (NR input). BT.709 limited-range YUV -> RGB.
+    const char *src1 =
+        "Texture2D<float> Y : register(t0);\n"
+        "Texture2D<float2> UV : register(t1);\n"
+        "RWTexture2D<float4> dst : register(u0);\n"
+        "[numthreads(16,16,1)]\n"
+        "void CSMain(uint3 id : SV_DispatchThreadID) {\n"
+        "  float y = Y[id.xy];\n"
+        "  float2 uv = UV[uint2(id.x >> 1, id.y >> 1)];\n"
+        "  float yv = (y - 16.0f/255.0f) * (255.0f/219.0f);\n"
+        "  float u  = (uv.x - 128.0f/255.0f) * (255.0f/224.0f);\n"
+        "  float v  = (uv.y - 128.0f/255.0f) * (255.0f/224.0f);\n"
+        "  float r = yv + 1.5748f * v;\n"
+        "  float g = yv - 0.1873f * u - 0.4681f * v;\n"
+        "  float b = yv + 1.8556f * u;\n"
+        "  dst[id.xy] = float4(saturate(r), saturate(g), saturate(b), 1.0f);\n"
+        "}\n";
+    // cs2: RGBA16F -> RGBA8 (NR output, and also "original" for side-by-side).
+    const char *src2 =
+        "Texture2D<float4> src : register(t0);\n"
+        "RWTexture2D<unorm float4> dst : register(u0);\n"
+        "[numthreads(16,16,1)]\n"
+        "void CSMain(uint3 id : SV_DispatchThreadID) {\n"
+        "  float4 c = src[id.xy];\n"
+        "  dst[id.xy] = float4(c.rgb, 1.0f);\n"
+        "}\n";
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC ps = {};
+    ps.pRootSignature = g_rs.Get();
+
+    ComPtr<ID3DBlob> b1, e1, b2, e2;
+    if (FAILED(D3DCompile(src1, strlen(src1), "cs0", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b1, &e1)))
+        { Log("FAIL: compile cs0: %s", e1 ? (char *)e1->GetBufferPointer() : "?"); return false; }
+    if (FAILED(D3DCompile(src2, strlen(src2), "cs2", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b2, &e2)))
+        { Log("FAIL: compile cs2: %s", e2 ? (char *)e2->GetBufferPointer() : "?"); return false; }
+
+    ps.CS = { b1->GetBufferPointer(), b1->GetBufferSize() };
+    if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_in)))) return false;
+    ps.CS = { b2->GetBufferPointer(), b2->GetBufferSize() };
+    if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_out)))) return false;
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 7; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_cbv_heap)))) return false;
+    UINT inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE base = g_cbv_heap->GetCPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+    // [0] SRV Y (R8)
+    srv.Format = DXGI_FORMAT_R8_UNORM;
+    g_dev->CreateShaderResourceView(g_y_tex.Get(), &srv, { base.ptr });
+    // [1] SRV UV (R8G8)
+    srv.Format = DXGI_FORMAT_R8G8_UNORM;
+    g_dev->CreateShaderResourceView(g_uv_tex.Get(), &srv, { base.ptr + inc });
+    // [2] UAV nr_in (RGBA16F)
+    uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g_dev->CreateUnorderedAccessView(g_nr_in.Get(), nullptr, &uav, { base.ptr + 2 * inc });
+    // [3] SRV nr_out (RGBA16F)
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g_dev->CreateShaderResourceView(g_nr_out.Get(), &srv, { base.ptr + 3 * inc });
+    // [4] UAV stage (RGBA8)
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    g_dev->CreateUnorderedAccessView(g_stage_rgba.Get(), nullptr, &uav, { base.ptr + 4 * inc });
+    // [5] SRV nr_in (RGBA16F) — for the "original" pass
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g_dev->CreateShaderResourceView(g_nr_in.Get(), &srv, { base.ptr + 5 * inc });
+    // [6] UAV orig (RGBA8)
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    g_dev->CreateUnorderedAccessView(g_orig_rgba.Get(), nullptr, &uav, { base.ptr + 6 * inc });
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// window + swapchain (RGBA8)
+// ---------------------------------------------------------------------------
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
+{
+    switch (m)
+    {
+    case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
+    case WM_HSCROLL:
+        if ((HWND)lp == g_trackbar)
+        {
+            int pos = (int)SendMessageW(g_trackbar, TBM_GETPOS, 0, 0);
+            if (g_duration > 0) g_seek_to = (double)pos / 1000.0 * g_duration;
+            WORD code = LOWORD(wp);
+            bool force = (code == TB_THUMBPOSITION || code == TB_ENDTRACK);
+            ULONGLONG now = GetTickCount64();
+            if (force || now - g_last_seek_tick > 150)
+                { g_seek_requested = true; g_last_seek_tick = now; }
+            if (code == TB_THUMBTRACK) g_dragging = true;
+            else if (force) g_dragging = false;
+            return 0;
+        }
+        break;
+    case WM_CLOSE: case WM_DESTROY: g_running = false; PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcW(hwnd, m, wp, lp);
+}
+
+static bool SetupWindow(UINT w, UINT h)
+{
+    UINT dw = g_side ? w * 2 : w; // side-by-side doubles the width
+    const UINT TBH = 28;          // trackbar (seek bar) height
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"nr_player";
+    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    DWORD style = WS_OVERLAPPEDWINDOW;
+    RECT r = { 0, 0, (LONG)dw, (LONG)(h + TBH) };
+    AdjustWindowRect(&r, style, FALSE);
+    g_hwnd = CreateWindowExW(0, L"nr_player", L"DLSS5 NR player", style,
+                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g_hwnd) return false;
+
+    // seek bar (child trackbar at the bottom)
+    g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+                                 0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
+    if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
+
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.Width = dw; sd.Height = h + TBH;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Scaling = DXGI_SCALING_STRETCH;
+    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+    ComPtr<IDXGISwapChain1> sc1;
+    if (FAILED(g_factory2->CreateSwapChainForHwnd(g_queue.Get(), g_hwnd, &sd, nullptr, nullptr, &sc1)))
+        { Log("FAIL: CreateSwapChainForHwnd"); return false; }
+    sc1.As(&g_swap);
+    ShowWindow(g_hwnd, SW_SHOW);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg / ffprobe (subprocess helpers)
+// ---------------------------------------------------------------------------
+static std::string RunCapture(const std::wstring &cmdline)
+{
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return "";
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    std::wstring cl = cmdline;
+    if (!CreateProcessW(nullptr, &cl[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        { CloseHandle(rd); CloseHandle(wr); return ""; }
+    CloseHandle(wr);
+    std::string out; char buf[4096]; DWORD n;
+    while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) out.append(buf, n);
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, 10000);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return out;
+}
+
+// spawn ffmpeg with stdout piped; returns the read handle (or NULL)
+static HANDLE SpawnFfmpeg(const std::wstring &input, double seek, HANDLE *proc)
+{
+    std::wstring cmdline = L"ffmpeg -hide_banner -loglevel error -hwaccel cuda ";
+    if (seek > 0) { wchar_t b[64]; swprintf_s(b, L"-ss %.3f ", seek); cmdline += b; }
+    cmdline += L"-i \"" + input + L"\" -an -f rawvideo -pix_fmt nv12 -";
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return nullptr;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        { CloseHandle(rd); CloseHandle(wr); Log("FAIL: cannot spawn ffmpeg"); return nullptr; }
+    CloseHandle(wr);
+    CloseHandle(pi.hThread);
+    if (proc) *proc = pi.hProcess; else CloseHandle(pi.hProcess);
+    return rd;
+}
+
+static bool ProbeVideo(const std::wstring &input, UINT *w, UINT *h, double *fps)
+{
+    std::wstring cmdline = L"ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 \"" + input + L"\"";
+    std::string out = RunCapture(cmdline);
+    // format: 1920,1080,60/1\n
+    int W = 0, H = 0, num = 0, den = 1;
+    if (sscanf_s(out.c_str(), "%d,%d,%d/%d", &W, &H, &num, &den) < 2)
+        { Log("FAIL: ffprobe parse (%s)", out.c_str()); return false; }
+    *w = W; *h = H;
+    *fps = (num > 0 && den > 0) ? (double)num / (double)den : 30.0;
+    return true;
+}
+
+static bool ProbeDuration(const std::wstring &input, double *dur)
+{
+    std::wstring cmdline = L"ffprobe -v error -show_entries format=duration -of csv=p=0 \"" + input + L"\"";
+    std::string out = RunCapture(cmdline);
+    double d = atof(out.c_str());
+    if (d <= 0) return false;
+    *dur = d;
+    return true;
+}
+
+// spawn ffmpeg decoding audio -> raw float32 stereo 48kHz on stdout
+static HANDLE SpawnAudio(const std::wstring &input, double seek, HANDLE *proc)
+{
+    std::wstring cmdline = L"ffmpeg -hide_banner -loglevel error ";
+    if (seek > 0) { wchar_t b[64]; swprintf_s(b, L"-ss %.3f ", seek); cmdline += b; }
+    cmdline += L"-i \"" + input + L"\" -vn -f f32le -ac 2 -ar 48000 -";
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return nullptr;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        { CloseHandle(rd); CloseHandle(wr); return nullptr; }
+    CloseHandle(wr);
+    CloseHandle(pi.hThread);
+    if (proc) *proc = pi.hProcess; else CloseHandle(pi.hProcess);
+    return rd;
+}
+
+// spawn the encode ffmpeg (reads NR RGBA from stdin, encodes + muxes original audio)
+static HANDLE SpawnEncoder(const std::wstring &input, const std::wstring &output, HANDLE *proc)
+{
+    std::wstring cmdline = L"ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt rgba ";
+    wchar_t b[64];
+    swprintf_s(b, L"-s %ux%u ", g_vid_w, g_vid_h); cmdline += b;
+    swprintf_s(b, L"-r %.6f ", g_fps); cmdline += b;
+    cmdline += L"-i - -i \"" + input + L"\" -map 0:v:0 -map 1:a:0? ";
+    swprintf_s(b, L"-c:v libx264 -pix_fmt yuv420p -crf %d ", g_crf); cmdline += b;
+    cmdline += L"-preset medium -c:a copy -movflags +faststart -y \"" + output + L"\"";
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return nullptr;
+    SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0); // parent keeps the write end (not inherited)
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = rd; si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        { CloseHandle(rd); CloseHandle(wr); return nullptr; }
+    CloseHandle(rd);
+    CloseHandle(pi.hThread);
+    if (proc) *proc = pi.hProcess; else CloseHandle(pi.hProcess);
+    return wr;  // write end (stdin of the encoder)
+}
+
+// read exactly `want` bytes from the pipe (blocks; returns bytes read, 0 on EOF)
+static size_t ReadPipe(HANDLE rd, void *buf, size_t want)
+{
+    size_t got = 0;
+    while (got < want)
+    {
+        DWORD n = 0;
+        if (!ReadFile(rd, (char *)buf + got, (DWORD)(want - got), &n, nullptr)) break;
+        if (n == 0) break; // EOF
+        got += n;
+    }
+    return got;
+}
+
+// audio playback thread: waveOut + continuous refill from the PCM pipe
+static DWORD WINAPI AudioThread(LPVOID)
+{
+    WAVEFORMATEX wf = {};
+    wf.wFormatTag = 0x0003; // WAVE_FORMAT_IEEE_FLOAT
+    wf.nChannels = 2;
+    wf.nSamplesPerSec = 48000;
+    wf.wBitsPerSample = 32;
+    wf.nBlockAlign = wf.nChannels * wf.wBitsPerSample / 8;   // 8
+    wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign; // 384000
+    HWAVEOUT hwo;
+    if (waveOutOpen(&hwo, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
+        { g_audio_done = true; return 0; }
+
+    const int NUM = 12;
+    const DWORD CHUNK = 4800 * wf.nBlockAlign; // 100 ms
+    struct Buf { std::vector<char> d; WAVEHDR h; bool active; };
+    std::vector<Buf> bufs(NUM);
+    for (auto &b : bufs) { b.d.resize(CHUNK); b.active = false; }
+
+    // prefill
+    for (auto &b : bufs)
+    {
+        size_t n = ReadPipe(g_audio_read, b.d.data(), CHUNK);
+        if (n == 0) { g_audio_done = true; break; }
+        b.h = {}; b.h.lpData = b.d.data(); b.h.dwBufferLength = (DWORD)n;
+        waveOutPrepareHeader(hwo, &b.h, sizeof(WAVEHDR));
+        waveOutWrite(hwo, &b.h, sizeof(WAVEHDR));
+        b.active = true;
+    }
+
+    while (g_running && !g_audio_done)
+    {
+        bool refilled = false;
+        for (auto &b : bufs)
+        {
+            if (b.active && (b.h.dwFlags & WHDR_DONE))
+            {
+                waveOutUnprepareHeader(hwo, &b.h, sizeof(WAVEHDR));
+                size_t n = ReadPipe(g_audio_read, b.d.data(), CHUNK);
+                if (n == 0) { g_audio_done = true; break; }
+                b.h = {}; b.h.lpData = b.d.data(); b.h.dwBufferLength = (DWORD)n;
+                waveOutPrepareHeader(hwo, &b.h, sizeof(WAVEHDR));
+                waveOutWrite(hwo, &b.h, sizeof(WAVEHDR));
+                refilled = true;
+            }
+        }
+        if (!refilled) Sleep(5);
+    }
+
+    waveOutReset(hwo);
+    for (auto &b : bufs)
+        if (b.active) waveOutUnprepareHeader(hwo, &b.h, sizeof(WAVEHDR));
+    waveOutClose(hwo);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// seek: restart both ffmpeg processes at a new position
+// ---------------------------------------------------------------------------
+static void Seek(const std::wstring &input, double t)
+{
+    // stop video ffmpeg
+    if (g_ffproc) { TerminateProcess(g_ffproc, 0); CloseHandle(g_ffproc); g_ffproc = nullptr; }
+    if (g_ffread) { CloseHandle(g_ffread); g_ffread = nullptr; }
+    // stop audio ffmpeg, wait for the playback thread to drain (pipe EOF), then close
+    if (g_afproc) { TerminateProcess(g_afproc, 0); CloseHandle(g_afproc); g_afproc = nullptr; }
+    if (g_audio_thread) { WaitForSingleObject(g_audio_thread, 2000); CloseHandle(g_audio_thread); g_audio_thread = nullptr; }
+    if (g_audio_read) { CloseHandle(g_audio_read); g_audio_read = nullptr; }
+    g_audio_done = false;
+
+    g_base_time = t;
+    g_frame_index = 0; // reset NR temporal history (Reset=1 on next frame)
+
+    g_ffread = SpawnFfmpeg(input, t, &g_ffproc);
+    g_audio_read = SpawnAudio(input, t, &g_afproc);
+    if (g_audio_read)
+        g_audio_thread = CreateThread(nullptr, 0, AudioThread, nullptr, 0, nullptr);
+    Log("seek -> %.2fs", t);
+}
+
+// ---------------------------------------------------------------------------
+// upload + render one frame
+// ---------------------------------------------------------------------------
+static bool ReadFrame(HANDLE rd, std::vector<uint8_t> &buf)
+{
+    size_t need = buf.size(), got = 0;
+    while (got < need)
+    {
+        DWORD n = 0;
+        if (!ReadFile(rd, buf.data() + got, (DWORD)(need - got), &n, nullptr) || n == 0)
+            return false; // EOF or error
+        got += n;
+    }
+    return true;
+}
+
+static void RenderFrame(const uint8_t *nv12)
+{
+    UINT slot = g_frame_slot;
+    ULONGLONG wt0 = GetTickCount64();
+    WaitFence(g_fence[slot].Get(), g_fence_value[slot]);
+    g_wait_ms += (double)(GetTickCount64() - wt0);
+    g_cmd_alloc[slot]->Reset();
+    g_list->Reset(g_cmd_alloc[slot].Get(), nullptr);
+
+    // copy NV12 (Y plane + interleaved UV plane, tight) into padded staging
+    ULONGLONG ut0 = GetTickCount64();
+    uint8_t *stg = nullptr;
+    g_staging->Map(0, nullptr, (void **)&stg);
+    UINT64 y_size = (UINT64)g_row_pitch * g_vid_h;
+    const uint8_t *y_src = nv12;
+    const uint8_t *uv_src = nv12 + (size_t)g_vid_w * g_vid_h;
+    for (UINT y = 0; y < g_vid_h; ++y)
+        memcpy(stg + (size_t)y * g_row_pitch, y_src + (size_t)y * g_vid_w, g_vid_w);
+    for (UINT y = 0; y < g_vid_h / 2; ++y)
+        memcpy(stg + y_size + (size_t)y * g_row_pitch, uv_src + (size_t)y * g_vid_w, g_vid_w);
+    g_staging->Unmap(0, nullptr);
+    g_upload_ms += (double)(GetTickCount64() - ut0);
+
+    D3D12_RESOURCE_BARRIER bars[8];
+    UINT nb = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+    D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+    src_loc.pResource = g_staging.Get();
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src_loc.PlacedFootprint.Footprint.Depth = 1;
+    src_loc.PlacedFootprint.Footprint.RowPitch = g_row_pitch;
+
+    // upload Y and UV
+    bars[nb++] = Trans(g_y_tex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    bars[nb++] = Trans(g_uv_tex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_list->ResourceBarrier(nb, bars);
+
+    dst_loc.pResource = g_y_tex.Get();
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst_loc.SubresourceIndex = 0;
+    src_loc.PlacedFootprint.Offset = 0;
+    src_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+    src_loc.PlacedFootprint.Footprint.Width = g_vid_w;
+    src_loc.PlacedFootprint.Footprint.Height = g_vid_h;
+    g_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+    dst_loc.pResource = g_uv_tex.Get();
+    src_loc.PlacedFootprint.Offset = y_size;
+    src_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8_UNORM;
+    src_loc.PlacedFootprint.Footprint.Width = g_vid_w / 2;
+    src_loc.PlacedFootprint.Footprint.Height = g_vid_h / 2;
+    g_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+    // Y/UV -> NPSR (cs0 reads); nr_in: NPSR -> UAV (cs0 writes)
+    nb = 0;
+    bars[nb++] = Trans(g_y_tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    bars[nb++] = Trans(g_uv_tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    bars[nb++] = Trans(g_nr_in.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_list->ResourceBarrier(nb, bars);
+
+    ID3D12DescriptorHeap *heaps[] = { g_cbv_heap.Get() };
+    g_list->SetDescriptorHeaps(1, heaps);
+    UINT inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_GPU_DESCRIPTOR_HANDLE h0 = g_cbv_heap->GetGPUDescriptorHandleForHeapStart();
+
+    // cs0: NV12 -> RGBA16F (NR input)
+    g_list->SetPipelineState(g_pso_in.Get());
+    g_list->SetComputeRootSignature(g_rs.Get());
+    g_list->SetComputeRootDescriptorTable(0, h0);                        // Y
+    g_list->SetComputeRootDescriptorTable(1, { h0.ptr + inc });          // UV
+    g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 2 * inc });      // nr_in UAV
+    g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
+
+    // nr_in: UAV -> NPSR (NR reads)
+    nb = 0;
+    bars[nb++] = Trans(g_nr_in.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_list->ResourceBarrier(nb, bars);
+
+    g_params->Set("DLSSNR.Reset", g_frame_index == 0 ? 1 : 0);
+    NVSDK_NGX_Result re;
+    if (g_nr_eval && g_shim_eval)
+        re = g_shim_eval((void *)g_nr_eval, g_list.Get(), g_feature, g_params, nullptr);
+    else
+        re = g_eval(g_list.Get(), g_feature, g_params, nullptr);
+    if (re != NGX_SUCCESS) Log("Evaluate -> 0x%08X", (unsigned)re);
+
+    // nr_out: UAV -> NPSR (cs2 reads); stage/orig: COMMON -> UAV (cs2 writes)
+    nb = 0;
+    bars[nb++] = Trans(g_nr_out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (g_side)
+        bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_list->ResourceBarrier(nb, bars);
+
+    // cs2: NR output -> stage (right side)
+    g_list->SetPipelineState(g_pso_out.Get());
+    g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 3 * inc });      // nr_out SRV
+    g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 4 * inc });      // stage UAV
+    g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
+
+    // cs2: NR input (original) -> orig (left side), side-by-side only
+    if (g_side)
+    {
+        g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 5 * inc });  // nr_in SRV
+        g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 6 * inc });  // orig UAV
+        g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
+    }
+
+    // copy to backbuffer
+    UINT bb = g_swap->GetCurrentBackBufferIndex();
+    ComPtr<ID3D12Resource> backbuffer;
+    g_swap->GetBuffer(bb, IID_PPV_ARGS(&backbuffer));
+    nb = 0;
+    bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (g_side)
+        bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    bars[nb++] = Trans(backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_list->ResourceBarrier(nb, bars);
+
+    D3D12_TEXTURE_COPY_LOCATION d2 = {};
+    d2.pResource = backbuffer.Get();
+    d2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    d2.SubresourceIndex = 0;
+    if (g_side)
+    {
+        D3D12_TEXTURE_COPY_LOCATION so = {};
+        so.pResource = g_orig_rgba.Get();
+        so.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        so.SubresourceIndex = 0;
+        g_list->CopyTextureRegion(&d2, 0, 0, 0, &so, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION s2 = {};
+        s2.pResource = g_stage_rgba.Get();
+        s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s2.SubresourceIndex = 0;
+        g_list->CopyTextureRegion(&d2, g_vid_w, 0, 0, &s2, nullptr);
+    }
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION s2 = {};
+        s2.pResource = g_stage_rgba.Get();
+        s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s2.SubresourceIndex = 0;
+        g_list->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+    }
+
+    // offline: copy NR output (stage) into the readback buffer for encoding
+    if (!g_output.empty())
+    {
+        D3D12_TEXTURE_COPY_LOCATION rd = {};
+        rd.pResource = g_readback.Get();
+        rd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        rd.PlacedFootprint.Offset = 0;
+        rd.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.PlacedFootprint.Footprint.Width = g_vid_w;
+        rd.PlacedFootprint.Footprint.Height = g_vid_h;
+        rd.PlacedFootprint.Footprint.Depth = 1;
+        rd.PlacedFootprint.Footprint.RowPitch = (g_vid_w * 4 + 255) & ~255u;
+        D3D12_TEXTURE_COPY_LOCATION ss = {};
+        ss.pResource = g_stage_rgba.Get();
+        ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        ss.SubresourceIndex = 0;
+        g_list->CopyTextureRegion(&rd, 0, 0, 0, &ss, nullptr);
+    }
+
+    // restore states
+    nb = 0;
+    bars[nb++] = Trans(backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (g_side)
+        bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    bars[nb++] = Trans(g_nr_out.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_list->ResourceBarrier(nb, bars);
+
+    g_list->Close();
+    ID3D12CommandList *cmds[] = { g_list.Get() };
+    g_queue->ExecuteCommandLists(1, cmds);
+    g_queue->Signal(g_fence[slot].Get(), ++g_fence_value[slot]);
+    g_swap->Present((g_fast || !g_output.empty()) ? 0 : 1, 0);
+    ++g_frame_index;
+    g_last_slot = slot;
+    g_frame_slot = (slot + 1) % FRAMES_IN_FLIGHT;
+}
+
+// read back the stage RGBA8 texture and write tight RGBA bytes to a file
+static void DumpFirstFrame()
+{
+    // drain in-flight frames so an allocator can be safely reused
+    for (int i = 0; i < FRAMES_IN_FLIGHT; ++i)
+        WaitFence(g_fence[i].Get(), g_fence_value[i]);
+    g_cmd_alloc[0]->Reset();
+    g_list->Reset(g_cmd_alloc[0].Get(), nullptr);
+    D3D12_RESOURCE_BARRIER b = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g_list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION s = {};
+    s.pResource = g_stage_rgba.Get(); s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION d = {};
+    d.pResource = g_readback.Get(); d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    d.PlacedFootprint.Offset = 0;
+    d.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.PlacedFootprint.Footprint.Width = g_vid_w;
+    d.PlacedFootprint.Footprint.Height = g_vid_h;
+    d.PlacedFootprint.Footprint.Depth = 1;
+    d.PlacedFootprint.Footprint.RowPitch = (g_vid_w * 4 + 255) & ~255u;
+    g_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    ExecuteAndWait();
+    void *m = nullptr;
+    g_readback->Map(0, nullptr, &m);
+    FILE *f = _wfopen(g_dump_path.c_str(), L"wb");
+    UINT rgba_pitch = (g_vid_w * 4 + 255) & ~255u;
+    if (f)
+    {
+        const uint8_t *src = (const uint8_t *)m;
+        for (UINT y = 0; y < g_vid_h; ++y)
+            fwrite(src + (size_t)y * rgba_pitch, 1, (size_t)g_vid_w * 4, f);
+        fclose(f);
+        Log("dumped first frame -> %ls", g_dump_path.c_str());
+    }
+    g_readback->Unmap(0, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// wmain
+// ---------------------------------------------------------------------------
+int wmain(int argc, wchar_t **argv)
+{
+    std::wstring input;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::wstring a = argv[i];
+        if (a == L"--gpu" && i + 1 < argc) g_gpu_index = _wtoi(argv[++i]);
+        else if (a == L"--style" && i + 1 < argc) { char b[64]; WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, b, 64, nullptr, nullptr); g_style = b; }
+        else if (a == L"--preset" && i + 1 < argc) g_preset = _wtoi(argv[++i]);
+        else if (a == L"--intensity" && i + 1 < argc) g_intensity = _wtoi(argv[++i]);
+        else if (a == L"--tone" && i + 1 < argc) g_tone = _wtoi(argv[++i]);
+        else if (a == L"--structure" && i + 1 < argc) g_structure = _wtoi(argv[++i]);
+        else if (a == L"--skin" && i + 1 < argc) g_skin = _wtoi(argv[++i]);
+        else if (a == L"--mask" && i + 1 < argc) g_mask = _wtoi(argv[++i]);
+        else if (a == L"--fast") g_fast = true;
+        else if (a == L"--nr-only") g_side = false;
+        else if (a == L"--dump" && i + 1 < argc) g_dump_path = argv[++i];
+        else if (a == L"--output" && i + 1 < argc) g_output = argv[++i];
+        else if (a == L"--crf" && i + 1 < argc) g_crf = _wtoi(argv[++i]);
+        else input = a;
+    }
+    if (input.empty()) { Log("usage: nr_player.exe <video> [--gpu N] [--fast] [--output out.mp4] ..."); return 1; }
+    if (!g_output.empty() && g_fast) { Log("note: offline mode (--output) already runs full speed"); }
+
+    // common controls (trackbar)
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icc);
+
+    if (!ProbeVideo(input, &g_vid_w, &g_vid_h, &g_fps))
+        Fatal("cannot probe video");
+    Log("video %ux%u @ %.2f fps", g_vid_w, g_vid_h, g_fps);
+    if (ProbeDuration(input, &g_duration))
+        Log("duration %.1fs", g_duration);
+
+    g_row_pitch = (g_vid_w + 255) & ~255u; // Y/UV row pitch (both W bytes per row)
+    if (!CreateDevice()) Fatal("device failed");
+
+    // textures
+    g_y_tex   = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_FLAG_NONE);
+    g_uv_tex  = MakeTex(g_vid_w / 2, g_vid_h / 2, DXGI_FORMAT_R8G8_UNORM, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_FLAG_NONE);
+    g_nr_in   = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_nr_out  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_stage_rgba = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_orig_rgba  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    // staging (upload) buffer: Y plane (padded) then UV plane (padded)
+    D3D12_RESOURCE_DESC sbd = {};
+    sbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    sbd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    sbd.Width = (UINT64)g_row_pitch * g_vid_h + (UINT64)g_row_pitch * (g_vid_h / 2);
+    sbd.Height = 1; sbd.DepthOrArraySize = 1; sbd.MipLevels = 1;
+    sbd.SampleDesc.Count = 1; sbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES shp = {};
+    shp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    if (FAILED(g_dev->CreateCommittedResource(&shp, D3D12_HEAP_FLAG_NONE, &sbd,
+                                              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_staging))))
+        Fatal("staging failed");
+
+    if (!SetupNGX(g_vid_w, g_vid_h)) Fatal("NGX failed");
+    if (!SetupCompute()) Fatal("compute failed");
+    if (!SetupWindow(g_vid_w, g_vid_h)) Fatal("window failed");
+
+    // readback buffer for --dump / --output
+    if (!g_dump_path.empty() || !g_output.empty())
+    {
+        D3D12_RESOURCE_DESC rbd = {};
+        rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rbd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        rbd.Width = (UINT64)((g_vid_w * 8 + 255) & ~255u) * g_vid_h;
+        rbd.Height = 1; rbd.DepthOrArraySize = 1; rbd.MipLevels = 1;
+        rbd.SampleDesc.Count = 1; rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES rhp = {};
+        rhp.Type = D3D12_HEAP_TYPE_READBACK;
+        if (FAILED(g_dev->CreateCommittedResource(&rhp, D3D12_HEAP_FLAG_NONE, &rbd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_readback))))
+            Fatal("readback failed");
+    }
+
+    g_ffread = SpawnFfmpeg(input, 0, &g_ffproc);
+    if (!g_ffread) Fatal("cannot start ffmpeg");
+
+    // audio: spawn a second ffmpeg + playback thread (skip if no audio stream)
+    g_audio_read = SpawnAudio(input, 0, &g_afproc);
+    if (g_audio_read)
+    {
+        g_audio_thread = CreateThread(nullptr, 0, AudioThread, nullptr, 0, nullptr);
+        Log("audio: on");
+    }
+    else Log("audio: none (no stream / ffmpeg failed)");
+
+    // offline mode: spawn the encoder (NR RGBA -> output file)
+    if (!g_output.empty())
+    {
+        g_enc_write = SpawnEncoder(input, g_output, &g_enc_proc);
+        if (!g_enc_write) Fatal("cannot start encoder");
+        Log("encoding to %ls (crf %d)", g_output.c_str(), g_crf);
+    }
+
+    Log("playing (ESC to stop). NR on GPU %d.", g_gpu_index < 0 ? 0 : g_gpu_index);
+
+    std::vector<uint8_t> frame((size_t)g_vid_w * g_vid_h * 3 / 2); // NV12: Y + interleaved UV
+    std::vector<uint8_t> rgba_tight;
+    if (!g_output.empty()) rgba_tight.resize((size_t)g_vid_w * g_vid_h * 4);
+    ULONGLONG t0 = GetTickCount64();
+    double next_t = (double)t0;
+    UINT64 frames = 0;
+    double frame_ms = g_fast ? 0.0 : 1000.0 / g_fps;
+    MSG msg;
+
+    while (g_running)
+    {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT) { g_running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!g_running) break;
+
+        // handle a pending seek
+        if (g_seek_requested)
+        {
+            Seek(input, g_seek_to);
+            g_seek_requested = false;
+            next_t = (double)GetTickCount64();
+            continue;
+        }
+
+        ULONGLONG rt0 = GetTickCount64();
+        if (!ReadFrame(g_ffread, frame)) { Log("EOF"); break; }
+        g_read_ms += (double)(GetTickCount64() - rt0);
+        RenderFrame(frame.data());
+        ++frames;
+
+        // offline: read back the NR output and feed it to the encoder
+        if (!g_output.empty())
+        {
+            WaitFence(g_fence[g_last_slot].Get(), g_fence_value[g_last_slot]);
+            void *m = nullptr;
+            g_readback->Map(0, nullptr, &m);
+            UINT rgba_pitch = (g_vid_w * 4 + 255) & ~255u;
+            const uint8_t *src = (const uint8_t *)m;
+            for (UINT y = 0; y < g_vid_h; ++y)
+                memcpy(rgba_tight.data() + (size_t)y * g_vid_w * 4, src + (size_t)y * rgba_pitch, g_vid_w * 4);
+            g_readback->Unmap(0, nullptr);
+            DWORD n = 0;
+            if (!WriteFile(g_enc_write, rgba_tight.data(), (DWORD)rgba_tight.size(), &n, nullptr) || n != rgba_tight.size())
+                { Log("encoder write failed"); break; }
+        }
+
+        // advance the seek bar (only when not dragging)
+        if (!g_dragging && g_trackbar && g_duration > 0)
+        {
+            double cur = g_base_time + (double)g_frame_index / g_fps;
+            int pos = (int)(cur / g_duration * 1000.0);
+            SendMessageW(g_trackbar, TBM_SETPOS, TRUE, pos);
+        }
+
+        if (!g_dump_path.empty() && g_frame_index == 1)
+        { DumpFirstFrame(); g_dump_path.clear(); }
+
+        ULONGLONG t1 = GetTickCount64();
+        if (t1 - t0 >= 2000)
+        {
+            double fps = frames * 1000.0 / (t1 - t0);
+            Log("%.1f fps (%llu frames)  read=%.1fms wait=%.1fms upload=%.1fms",
+                fps, (unsigned long long)frames, g_read_ms / frames, g_wait_ms / frames, g_upload_ms / frames);
+            frames = 0; t0 = t1;
+            g_read_ms = g_wait_ms = g_upload_ms = 0;
+        }
+        if (!g_fast && g_output.empty())
+        {
+            next_t += frame_ms;
+            double now = (double)GetTickCount64();
+            if (now < next_t) Sleep((DWORD)(next_t - now));
+        }
+    }
+
+    // finalize the encoder (offline)
+    if (g_enc_write) { CloseHandle(g_enc_write); g_enc_write = nullptr; }
+    if (g_enc_proc) { WaitForSingleObject(g_enc_proc, 600000); CloseHandle(g_enc_proc); g_enc_proc = nullptr; }
+    if (!g_output.empty()) Log("encoded -> %ls", g_output.c_str());
+
+    if (g_ffread) CloseHandle(g_ffread);
+    if (g_ffproc) { TerminateProcess(g_ffproc, 0); CloseHandle(g_ffproc); }
+    if (g_audio_thread) { WaitForSingleObject(g_audio_thread, 2000); CloseHandle(g_audio_thread); }
+    if (g_audio_read) CloseHandle(g_audio_read);
+    if (g_afproc) { TerminateProcess(g_afproc, 0); CloseHandle(g_afproc); }
+    if (g_feature && g_nr_release) { if (g_shim_release) g_shim_release((void *)g_nr_release, g_feature); else g_release(g_feature); }
+    if (g_shutdown) g_shutdown();
+    Log("stopped");
+    return 0;
+}

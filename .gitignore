@@ -1,0 +1,60 @@
+# Build artifacts
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# NVIDIA binaries (NOT redistributable — see README)
+_nvngx.dll
+nvngx.dll
+nvngx_dlss.dll
+nvngx_dlssg.dll
+nvngx_dlssnr.dll
+caller/nvngx.dll
+
+# NVIDIA NGX SDK headers (obtain from NVIDIA SDK — see README)
+nvsdk_ngx.h
+nvsdk_ngx_defs.h
+nvsdk_ngx_helpers.h
+nvsdk_ngx_params.h
+
+# External tools
+ffmpeg.exe
+ffprobe.exe
+
+# Test data / dumps / logs
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.ts
+*.m2ts
+*.flv
+*.wmv
+*.m4v
+*.png
+*.jpg
+*.jpeg
+*.rgba
+*.bin
+*.log
+*.txt
+
+# Test directories
+bench_in/
+bench_out/
+bench_ti_out/
+bench30_in/
+bench30_ti/
+test_in/
+test_out/
+real_in/
+real_out/
+seq_in/
+seq_out/
+seq_swap*/
+_work/
+logs/
