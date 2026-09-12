@@ -13,6 +13,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - Resize the window: controls remain visible below the video and wrap to a second row when needed.
 - **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.
 - **DLSS 5** button / **D**: toggle neural processing in single view. DLSS defaults on. Comparison always includes DLSS, so the DLSS toggle is disabled there; returning to single view restores the previous setting.
+- **Model** button / **M**: cycle between the Default, Natural, and Cinematic DLSS 5 models. The new model is applied immediately and also works while paused.
 - View controls also work while paused. The title shows the current mode. **Esc** closes the player.
 - Build a single-file portable executable containing your locally supplied dependencies. It opens without a batch-file launcher.
 

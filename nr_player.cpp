@@ -166,7 +166,7 @@ static ComPtr<ID3D12PipelineState> g_pso_out;  // RGBA16F -> RGBA8 (R/B swap)
 static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
-static HWND g_split_button = nullptr, g_dlss_button = nullptr;
+static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
 static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
@@ -215,6 +215,25 @@ static HANDLE g_ffread = nullptr, g_ffproc = nullptr, g_afproc = nullptr;
 static double g_read_ms = 0, g_wait_ms = 0, g_upload_ms = 0;
 
 static volatile bool g_running = true;
+
+static int StyleValue()
+{
+    if (g_style == "default") return 0;
+    if (g_style == "natural") return 1;
+    if (g_style == "cinematic") return 2;
+    return atoi(g_style.c_str());
+}
+
+static const wchar_t *StyleName()
+{
+    switch (StyleValue())
+    {
+    case 0: return L"Default";
+    case 1: return L"Natural";
+    case 2: return L"Cinematic";
+    default: return L"Custom";
+    }
+}
 
 // ---------------------------------------------------------------------------
 // logging
@@ -416,11 +435,7 @@ static bool SetupNGX(UINT w, UINT h)
     NVSDK_NGX_Result ra = g_alloc(&g_params);
     if (ra != NGX_SUCCESS || !g_params) { Log("FAIL: AllocateParameters"); return false; }
 
-    int style_int = 1;
-    if (g_style == "default") style_int = 0;
-    else if (g_style == "natural") style_int = 1;
-    else if (g_style == "cinematic") style_int = 2;
-    else style_int = atoi(g_style.c_str());
+    int style_int = StyleValue();
 
     g_params->Set("DLSSNR.Width", w);
     g_params->Set("DLSSNR.Height", h);
@@ -587,14 +602,18 @@ static void UpdateModeTitle()
                          (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original"));
     std::wstring title = L"DLSS5 NR player - ";
     title += mode;
-    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | Space: pause]" : L"  [Space: pause]";
+    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | M: model | Space: pause]" : L"  [Space: pause]";
     SetWindowTextW(g_hwnd, title.c_str());
     SetWindowTextW(g_split_button, !g_nr_available ? L"Split: N/A" : (g_side ? L"Split: ON" : L"Split: OFF"));
     SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_dlss_button, !g_nr_available ? L"DLSS 5: N/A" : ((g_side || g_nr_enabled) ? L"DLSS 5: ON" : L"DLSS 5: OFF"));
     SendMessageW(g_dlss_button, BM_SETCHECK, (g_side || g_nr_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
+    std::wstring modelText = g_nr_available ? L"Model: " : L"Model: N/A";
+    if (g_nr_available) modelText += StyleName();
+    SetWindowTextW(g_model_button, modelText.c_str());
     EnableWindow(g_split_button, g_nr_available);
     EnableWindow(g_dlss_button, g_nr_available && !g_side);
+    EnableWindow(g_model_button, g_nr_available);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_trackbar, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
@@ -626,6 +645,20 @@ static void ToggleNR()
     g_nr_reset = true;
     g_refresh_view = true;
     UpdateModeTitle();
+}
+
+static void CycleModel()
+{
+    if (!g_nr_available) return;
+    int next = StyleValue() + 1;
+    if (next < 0 || next > 2) next = 0;
+    static const char *styles[] = { "default", "natural", "cinematic" };
+    g_style = styles[next];
+    if (g_params) g_params->Set("DLSSNR.Style", next);
+    g_nr_reset = true;
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("DLSS 5 model: %s", g_style.c_str());
 }
 
 static void TogglePause()
@@ -694,13 +727,14 @@ static void LayoutControls(HWND hwnd)
 {
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
-    bool stacked = width < 600;
+    bool stacked = width < 720;
     int videoHeight = std::max(1, height - (stacked ? 76 : 40));
     if (g_video_hwnd) MoveWindow(g_video_hwnd, 0, 0, width, videoHeight, TRUE);
     if (g_pause_button) MoveWindow(g_pause_button, 6, videoHeight + 6, 80, 28, TRUE);
     if (g_split_button) MoveWindow(g_split_button, 92, videoHeight + 6, 100, 28, TRUE);
     if (g_dlss_button) MoveWindow(g_dlss_button, 198, videoHeight + 6, 100, 28, TRUE);
-    int seekX = stacked ? 6 : 304;
+    if (g_model_button) MoveWindow(g_model_button, stacked ? 6 : 304, videoHeight + (stacked ? 42 : 6), 130, 28, TRUE);
+    int seekX = stacked ? 142 : 440;
     if (g_trackbar) MoveWindow(g_trackbar, seekX, videoHeight + (stacked ? 42 : 6), std::max(1, width - seekX - 6), 28, TRUE);
 }
 
@@ -733,6 +767,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_pause_button && HIWORD(wp) == BN_CLICKED) { TogglePause(); return 0; }
         if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
+        if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
         break;
     case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
     case WM_DROPFILES:
@@ -802,11 +837,13 @@ static bool SetupWindow(UINT w, UINT h)
                                     0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                    0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     // seek bar (child trackbar at the bottom)
     g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
-    if (!g_video_hwnd || !g_pause_button || !g_split_button || !g_dlss_button || !g_trackbar) return false;
+    if (!g_video_hwnd || !g_pause_button || !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
     LayoutControls(g_hwnd);
     }
@@ -1403,10 +1440,12 @@ static int PlayVideo(const std::wstring &input)
         {
             if (msg.message == WM_QUIT) { g_running = false; break; }
             if (msg.message == WM_KEYDOWN && msg.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
-            if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D'))
+            if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D' || msg.wParam == 'M'))
             {
                 if (!(msg.lParam & (1LL << 30))) {
-                    if (msg.wParam == 'S') ToggleComparison(); else ToggleNR();
+                    if (msg.wParam == 'S') ToggleComparison();
+                    else if (msg.wParam == 'D') ToggleNR();
+                    else CycleModel();
                 }
                 continue;
             }
@@ -1622,6 +1661,7 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
             if (message.wParam == 'S') { ToggleComparison(); continue; }
             if (message.wParam == 'D') { ToggleNR(); continue; }
+            if (message.wParam == 'M') { CycleModel(); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
