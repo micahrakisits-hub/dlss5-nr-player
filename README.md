@@ -7,6 +7,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 ## Desktop features
 
 - Start with an empty player, then use **File → Open**, **Ctrl+O**, or drop a video onto the window.
+- Open **Help → Keyboard Shortcuts** to see all keyboard controls in the player.
 - Open another video in the same window. After playback ends, the window stays available for another file.
 - Pause/resume video and audio by clicking the video, using the button, or pressing **Space**.
 - Use the **Fullscreen** button or **F11** for fullscreen playback. Press **Esc** or **F11** to return to the normal window.

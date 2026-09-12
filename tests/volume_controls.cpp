@@ -9,6 +9,14 @@ int main()
     InitCommonControlsEx(&icc);
     assert(SetupWindow(960, 540));
     ShowWindow(g_hwnd, SW_HIDE);
+    HMENU appMenu = GetMenu(g_hwnd);
+    assert(appMenu && GetMenuItemCount(appMenu) == 2);
+    HMENU helpMenu = GetSubMenu(appMenu, 1);
+    assert(helpMenu && GetMenuState(helpMenu, ID_HELP_SHORTCUTS, MF_BYCOMMAND) != (UINT)-1);
+    assert(std::wcsstr(HOTKEY_HELP_TEXT, L"Ctrl+O") &&
+        std::wcsstr(HOTKEY_HELP_TEXT, L"Space") &&
+        std::wcsstr(HOTKEY_HELP_TEXT, L"F11") &&
+        std::wcsstr(HOTKEY_HELP_TEXT, L"Esc"));
     assert(g_volume == 100 && !g_muted);
     SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, 35);
     WndProc(g_hwnd, WM_HSCROLL, TB_THUMBTRACK, (LPARAM)g_volume_slider);
@@ -121,5 +129,5 @@ int main()
     assert(GetMenu(g_hwnd) == windowedMenu);
     for (HWND control : controls) assert(GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE);
     DestroyWindow(g_hwnd);
-    puts("PASS: playback controls, reversible layout, aspect-ratio fitting, and fullscreen restore");
+    puts("PASS: playback controls, help menu, reversible layout, aspect-ratio fitting, and fullscreen restore");
 }

@@ -114,6 +114,18 @@ typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
 typedef NVSDK_NGX_Result (*PFN_Shutdown)(void);
 
 static const int NR_FEATURE_ID = 18;
+static const UINT ID_FILE_OPEN = 1001;
+static const UINT ID_FILE_EXIT = 1002;
+static const UINT ID_HELP_SHORTCUTS = 1003;
+static const wchar_t HOTKEY_HELP_TEXT[] =
+    L"Ctrl+O\tOpen a video\r\n"
+    L"Space\tPause or resume\r\n"
+    L"Left / Right\tPrevious or next frame\r\n"
+    L"S\tToggle split comparison\r\n"
+    L"D\tToggle DLSS 5\r\n"
+    L"M\tCycle DLSS 5 model\r\n"
+    L"F11\tToggle fullscreen\r\n"
+    L"Esc\tExit fullscreen or close the player";
 
 // ---------------------------------------------------------------------------
 // globals
@@ -948,6 +960,11 @@ static void OpenVideoDialog(HWND hwnd)
     else if (wasPlaying) TogglePause();
 }
 
+static void ShowHotkeyHelp(HWND hwnd)
+{
+    MessageBoxW(hwnd, HOTKEY_HELP_TEXT, L"Keyboard Shortcuts", MB_OK | MB_ICONINFORMATION);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m)
@@ -956,8 +973,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     case WM_GETMINMAXINFO:
         ((MINMAXINFO *)lp)->ptMinTrackSize = {320, 300}; return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == 1001) { OpenVideoDialog(hwnd); return 0; }
-        if (LOWORD(wp) == 1002) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if (LOWORD(wp) == ID_FILE_OPEN) { OpenVideoDialog(hwnd); return 0; }
+        if (LOWORD(wp) == ID_FILE_EXIT) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if (LOWORD(wp) == ID_HELP_SHORTCUTS) { ShowHotkeyHelp(hwnd); return 0; }
         if ((HWND)lp == g_pause_button && HIWORD(wp) == BN_CLICKED) { TogglePause(); return 0; }
         if ((HWND)lp == g_prev_frame_button && HIWORD(wp) == BN_CLICKED) { RequestFrameStep(-1); return 0; }
         if ((HWND)lp == g_next_frame_button && HIWORD(wp) == BN_CLICKED) { RequestFrameStep(1); return 0; }
@@ -1030,11 +1048,13 @@ static bool SetupWindow(UINT w, UINT h)
                              CW_USEDEFAULT, CW_USEDEFAULT, std::min(r.right - r.left, work.right - work.left), std::min(r.bottom - r.top, work.bottom - work.top),
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) return false;
-    HMENU menu = CreateMenu(), file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, 1001, L"&Open...\tCtrl+O");
+    HMENU menu = CreateMenu(), file = CreatePopupMenu(), help = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING, ID_FILE_OPEN, L"&Open...\tCtrl+O");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, 1002, L"E&xit");
+    AppendMenuW(file, MF_STRING, ID_FILE_EXIT, L"E&xit");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)file, L"&File");
+    AppendMenuW(help, MF_STRING, ID_HELP_SHORTCUTS, L"&Keyboard Shortcuts...");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)help, L"&Help");
     SetMenu(g_hwnd, menu);
     DragAcceptFiles(g_hwnd, TRUE);
 
