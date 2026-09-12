@@ -29,6 +29,10 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <commdlg.h>
+#include <shellapi.h>
+#include <stdexcept>
+#include "nr_runtime.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -161,6 +165,16 @@ static ComPtr<ID3D12PipelineState> g_pso_out;  // RGBA16F -> RGBA8 (R/B swap)
 
 static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
+static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
+static HWND g_split_button = nullptr, g_dlss_button = nullptr;
+static bool g_gui = false, g_media_loaded = false;
+static std::wstring g_open_path;
+static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
+static NRRuntime g_runtime = NRRuntime::Unsupported;
+static std::wstring g_runtime_directory;
+static bool g_paused = false;
+static SRWLOCK g_audio_lock = SRWLOCK_INIT;
+static HWAVEOUT g_wave_out = nullptr;
 
 static UINT g_vid_w = 0, g_vid_h = 0;
 static UINT g_row_pitch = 0;
@@ -169,7 +183,10 @@ static int  g_gpu_index = -1;
 static std::string g_style = "natural";
 static int  g_preset = 3, g_intensity = 1, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
 static bool g_fast = false;
-static bool g_side = true;   // side-by-side: original | NR (default)
+static bool g_side = false;  // default: single DLSS 5 view
+static bool g_nr_enabled = true;
+static bool g_nr_reset = true;
+static bool g_refresh_view = false;
 static UINT64 g_frame_index = 0;
 static std::wstring g_dump_path;
 static std::wstring g_output;      // offline output file (empty = playback only)
@@ -208,10 +225,10 @@ static void Log(const char *fmt, ...)
 }
 static void Fatal(const char *fmt, ...)
 {
-    va_list ap; va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap); fprintf(stderr, "\n");
-    va_end(ap);
-    ExitProcess(1);
+    char message[1024];
+    va_list ap; va_start(ap, fmt); vsnprintf(message, sizeof(message), fmt, ap); va_end(ap);
+    Log("%s", message);
+    throw std::runtime_error(message);
 }
 
 static D3D12_RESOURCE_BARRIER Trans(ID3D12Resource *res, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
@@ -265,6 +282,12 @@ static bool CreateDevice()
     if (sel < 0) sel = 0;
     ComPtr<IDXGIAdapter1> chosen;
     g_factory->EnumAdapters1(sel, &chosen);
+    if (!chosen) { Log("FAIL: selected GPU is not available"); return false; }
+    DXGI_ADAPTER_DESC1 selectedDesc = {};
+    chosen->GetDesc1(&selectedDesc);
+    g_runtime = RuntimeForAdapter(selectedDesc.VendorId, selectedDesc.Description);
+    if (g_runtime == NRRuntime::Unsupported)
+        Fatal("This build requires a GeForce RTX 40-series or RTX 50-series GPU.");
     if (FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dev))))
         { Log("FAIL: D3D12CreateDevice"); return false; }
     Log("D3D12 adapter: index %d", sel);
@@ -305,7 +328,7 @@ static ComPtr<ID3D12Resource> MakeTex(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RES
 // ---------------------------------------------------------------------------
 static bool SetupNGX(UINT w, UINT h)
 {
-    HMODULE ngx = LoadLibraryW(L"_nvngx.dll");
+    HMODULE ngx = g_core_module ? g_core_module : LoadLibraryW(L"_nvngx.dll");
     if (!ngx)
     {
         WIN32_FIND_DATAW fd;
@@ -321,6 +344,7 @@ static bool SetupNGX(UINT w, UINT h)
         }
     }
     if (!ngx) { Log("FAIL: cannot load _nvngx.dll"); return false; }
+    g_core_module = ngx;
     g_init_ext       = (PFN_Init_Ext)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_Ext");
     g_init_projectid = (PFN_Init_ProjectID)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID");
     g_alloc          = (PFN_AllocateParameters)GetProcAddress(ngx, "NVSDK_NGX_D3D12_AllocateParameters");
@@ -329,14 +353,24 @@ static bool SetupNGX(UINT w, UINT h)
     g_release        = (PFN_D3D12ReleaseFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_ReleaseFeature");
     g_shutdown       = (PFN_Shutdown)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Shutdown");
 
-    HMODULE nr = LoadLibraryW(L"nvngx_dlssnr.dll");
-    if (!nr) { Log("FAIL: cannot load nvngx_dlssnr.dll"); return false; }
+    wchar_t executable[32768];
+    DWORD executableLength = GetModuleFileNameW(nullptr, executable, 32768);
+    if (!executableLength || executableLength >= 32768) return false;
+    std::wstring base(executable, executableLength);
+    base.resize(base.find_last_of(L"\\/") + 1);
+    std::wstring nrPath = base + RuntimeRelativePath(g_runtime);
+    g_runtime_directory = nrPath.substr(0, nrPath.find_last_of(L"\\/"));
+    Log("NR runtime: %s (%ls)", g_runtime == NRRuntime::RTX40 ? "RTX40 community patch" : "RTX50 original", nrPath.c_str());
+    HMODULE nr = g_nr_module ? g_nr_module : LoadLibraryW(nrPath.c_str());
+    if (!nr) { Log("FAIL: cannot load %ls (Windows error %lu)", nrPath.c_str(), GetLastError()); return false; }
+    g_nr_module = nr;
     g_direct_init = (PFN_Init_Ext)GetProcAddress(nr, "NVSDK_NGX_D3D12_Init_Ext");
     g_nr_create   = (PFN_D3D12CreateFeature)GetProcAddress(nr, "NVSDK_NGX_D3D12_CreateFeature");
     g_nr_eval     = (PFN_D3D12EvaluateFeature)GetProcAddress(nr, "NVSDK_NGX_D3D12_EvaluateFeature");
     g_nr_release  = (PFN_D3D12ReleaseFeature)GetProcAddress(nr, "NVSDK_NGX_D3D12_ReleaseFeature");
 
-    HMODULE shim = LoadLibraryW(L"caller\\nvngx.dll");
+    HMODULE shim = g_caller_module ? g_caller_module : LoadLibraryW(L"caller\\nvngx.dll");
+    g_caller_module = shim;
     if (shim)
     {
         g_shim_init    = (PFN_ShimInit)GetProcAddress(shim, "DLSSNR_CallInit");
@@ -350,8 +384,8 @@ static bool SetupNGX(UINT w, UINT h)
     wchar_t data_path[MAX_PATH] = L".";
     GetCurrentDirectoryW(MAX_PATH, data_path);
     const unsigned long long APP_ID = 141959980ULL;
-    const wchar_t *path_list[1] = { data_path };
-    NVSDK_NGX_PathListInfo pli = {}; pli.Path = path_list; pli.Length = 1;
+    const wchar_t *path_list[2] = { g_runtime_directory.c_str(), data_path };
+    NVSDK_NGX_PathListInfo pli = {}; pli.Path = path_list; pli.Length = 2;
     NVSDK_NGX_FeatureCommonInfo fci = {};
     fci.PathListInfo = pli;
     fci.LoggingInfo.LoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
@@ -538,11 +572,165 @@ static bool SetupCompute()
 // ---------------------------------------------------------------------------
 // window + swapchain (RGBA8)
 // ---------------------------------------------------------------------------
+static void UpdateModeTitle()
+{
+    const wchar_t *mode = g_side ? L"Original | DLSS 5" :
+                         (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original");
+    std::wstring title = L"DLSS5 NR player - ";
+    title += mode;
+    title += L"  [S: compare | D: DLSS on/off | Space: pause]";
+    SetWindowTextW(g_hwnd, title.c_str());
+    SetWindowTextW(g_split_button, g_side ? L"Split: ON" : L"Split: OFF");
+    SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowTextW(g_dlss_button, (g_side || g_nr_enabled) ? L"DLSS 5: ON" : L"DLSS 5: OFF");
+    SendMessageW(g_dlss_button, BM_SETCHECK, (g_side || g_nr_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(g_dlss_button, !g_side);
+    EnableWindow(g_pause_button, g_media_loaded);
+    EnableWindow(g_trackbar, g_media_loaded);
+    if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
+    Log("view: %s", g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original"));
+}
+
+static void ToggleComparison()
+{
+    if (!g_swap) { g_side = !g_side; UpdateModeTitle(); return; }
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
+        WaitFence(g_fence[i].Get(), g_fence_value[i]);
+    bool side = !g_side;
+    HRESULT hr = g_swap->ResizeBuffers(0, side ? g_vid_w * 2 : g_vid_w,
+                                       g_vid_h, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) { Log("FAIL: resize comparison buffers -> 0x%08X", (unsigned)hr); return; }
+    g_side = side;
+    g_nr_reset = true;
+    g_refresh_view = true;
+    UpdateModeTitle();
+}
+
+static void ToggleNR()
+{
+    if (g_side) return; // comparison always shows original alongside NR
+    g_nr_enabled = !g_nr_enabled;
+    g_nr_reset = true;
+    g_refresh_view = true;
+    UpdateModeTitle();
+}
+
+static void TogglePause()
+{
+    if (!g_media_loaded) return;
+    AcquireSRWLockExclusive(&g_audio_lock);
+    g_paused = !g_paused;
+    if (g_wave_out) {
+        if (g_paused) waveOutPause(g_wave_out);
+        else waveOutRestart(g_wave_out);
+    }
+    ReleaseSRWLockExclusive(&g_audio_lock);
+    SetWindowTextW(g_pause_button, g_paused ? L"Resume" : L"Pause");
+    Log("%s at frame %llu", g_paused ? "paused" : "resumed", (unsigned long long)g_frame_index);
+}
+
+static void SeekAtMouse(HWND hwnd, LPARAM lp, WORD notification)
+{
+    RECT channel, thumb;
+    SendMessageW(hwnd, TBM_GETCHANNELRECT, 0, (LPARAM)&channel);
+    SendMessageW(hwnd, TBM_GETTHUMBRECT, 0, (LPARAM)&thumb);
+    int x = (short)LOWORD(lp);
+    int thumbWidth = thumb.right - thumb.left;
+    int start = channel.left + thumbWidth / 2;
+    int span = std::max(1L, channel.right - channel.left - thumbWidth);
+    int pos = (int)(1000.0 * (x - start) / span + 0.5);
+    pos = std::max(0, std::min(1000, pos));
+    SendMessageW(hwnd, TBM_SETPOS, TRUE, pos);
+    SendMessageW(GetParent(hwnd), WM_HSCROLL, MAKEWPARAM(notification, pos), (LPARAM)hwnd);
+}
+
+static LRESULT CALLBACK SeekBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                    UINT_PTR id, DWORD_PTR)
+{
+    switch (message)
+    {
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        SetCapture(hwnd);
+        SeekAtMouse(hwnd, lp, TB_THUMBTRACK);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (GetCapture() == hwnd) { SeekAtMouse(hwnd, lp, TB_THUMBTRACK); return 0; }
+        break;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) {
+            SeekAtMouse(hwnd, lp, TB_ENDTRACK);
+            ReleaseCapture();
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (g_dragging) {
+            g_dragging = false;
+            SendMessageW(GetParent(hwnd), WM_HSCROLL, TB_ENDTRACK, (LPARAM)hwnd);
+        }
+        return 0;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, SeekBarProc, id);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+
+static void LayoutControls(HWND hwnd)
+{
+    RECT r; GetClientRect(hwnd, &r);
+    int width = r.right, height = r.bottom;
+    bool stacked = width < 600;
+    int videoHeight = std::max(1, height - (stacked ? 76 : 40));
+    if (g_video_hwnd) MoveWindow(g_video_hwnd, 0, 0, width, videoHeight, TRUE);
+    if (g_pause_button) MoveWindow(g_pause_button, 6, videoHeight + 6, 80, 28, TRUE);
+    if (g_split_button) MoveWindow(g_split_button, 92, videoHeight + 6, 100, 28, TRUE);
+    if (g_dlss_button) MoveWindow(g_dlss_button, 198, videoHeight + 6, 100, 28, TRUE);
+    int seekX = stacked ? 6 : 304;
+    if (g_trackbar) MoveWindow(g_trackbar, seekX, videoHeight + (stacked ? 42 : 6), std::max(1, width - seekX - 6), 28, TRUE);
+}
+
+static void OpenVideoDialog(HWND hwnd)
+{
+    bool wasPlaying = g_media_loaded && !g_paused;
+    if (wasPlaying) TogglePause();
+    wchar_t path[32768] = {};
+    OPENFILENAMEW dialog = {sizeof(dialog)};
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFilter = L"Video files\0*.mp4;*.mkv;*.avi;*.mov;*.webm;*.ts;*.m2ts;*.wmv;*.m4v\0All files\0*.*\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = 32768;
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    dialog.lpstrTitle = L"Open video";
+    if (GetOpenFileNameW(&dialog)) g_open_path = path;
+    else if (wasPlaying) TogglePause();
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m)
     {
+    case WM_SIZE: LayoutControls(hwnd); return 0;
+    case WM_GETMINMAXINFO:
+        ((MINMAXINFO *)lp)->ptMinTrackSize = {320, 200}; return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == 1001) { OpenVideoDialog(hwnd); return 0; }
+        if (LOWORD(wp) == 1002) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if ((HWND)lp == g_pause_button && HIWORD(wp) == BN_CLICKED) { TogglePause(); return 0; }
+        if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
+        if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
+        break;
     case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
+    case WM_DROPFILES:
+    {
+        HDROP drop = (HDROP)wp;
+        UINT length = DragQueryFileW(drop, 0, nullptr, 0);
+        std::vector<wchar_t> path(length + 1);
+        if (length && DragQueryFileW(drop, 0, path.data(), length + 1)) g_open_path = path.data();
+        DragFinish(drop);
+        return 0;
+    }
     case WM_HSCROLL:
         if ((HWND)lp == g_trackbar)
         {
@@ -565,8 +753,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
 
 static bool SetupWindow(UINT w, UINT h)
 {
+    if (!g_hwnd) {
     UINT dw = g_side ? w * 2 : w; // side-by-side doubles the width
-    const UINT TBH = 28;          // trackbar (seek bar) height
+    const UINT TBH = 40;          // controls stay outside the video surface
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
@@ -575,21 +764,51 @@ static bool SetupWindow(UINT w, UINT h)
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     RegisterClassExW(&wc);
 
-    DWORD style = WS_OVERLAPPEDWINDOW;
+    DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     RECT r = { 0, 0, (LONG)dw, (LONG)(h + TBH) };
-    AdjustWindowRect(&r, style, FALSE);
+    AdjustWindowRect(&r, style, TRUE);
+    RECT work; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     g_hwnd = CreateWindowExW(0, L"nr_player", L"DLSS5 NR player", style,
-                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+                             CW_USEDEFAULT, CW_USEDEFAULT, std::min(r.right - r.left, work.right - work.left), std::min(r.bottom - r.top, work.bottom - work.top),
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) return false;
+    HMENU menu = CreateMenu(), file = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING, 1001, L"&Open...\tCtrl+O");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, 1002, L"E&xit");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)file, L"&File");
+    SetMenu(g_hwnd, menu);
+    DragAcceptFiles(g_hwnd, TRUE);
 
+    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                  0, 0, dw, h, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                    0, 0, 80, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    DWORD toggleStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_CHECKBOX | BS_PUSHLIKE;
+    g_split_button = CreateWindowExW(0, L"BUTTON", L"Split: OFF", toggleStyle,
+                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
+                                   0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     // seek bar (child trackbar at the bottom)
     g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
+    if (!g_video_hwnd || !g_pause_button || !g_split_button || !g_dlss_button || !g_trackbar) return false;
+    if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
+    LayoutControls(g_hwnd);
+    }
+
+    if (!g_dev) {
+        SetWindowTextW(g_video_hwnd, L"Drop a video here, or choose File > Open");
+        SetWindowLongPtrW(g_video_hwnd, GWL_STYLE, GetWindowLongPtrW(g_video_hwnd, GWL_STYLE) | SS_CENTER);
+        UpdateModeTitle();
+        ShowWindow(g_hwnd, SW_SHOW);
+        return true;
+    }
+    SetWindowTextW(g_video_hwnd, L"");
 
     DXGI_SWAP_CHAIN_DESC1 sd = {};
-    sd.Width = dw; sd.Height = h + TBH;
+    sd.Width = g_side ? w * 2 : w; sd.Height = h;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -599,9 +818,10 @@ static bool SetupWindow(UINT w, UINT h)
     sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 
     ComPtr<IDXGISwapChain1> sc1;
-    if (FAILED(g_factory2->CreateSwapChainForHwnd(g_queue.Get(), g_hwnd, &sd, nullptr, nullptr, &sc1)))
+    if (FAILED(g_factory2->CreateSwapChainForHwnd(g_queue.Get(), g_video_hwnd, &sd, nullptr, nullptr, &sc1)))
         { Log("FAIL: CreateSwapChainForHwnd"); return false; }
     sc1.As(&g_swap);
+    UpdateModeTitle();
     ShowWindow(g_hwnd, SW_SHOW);
     return true;
 }
@@ -620,7 +840,7 @@ static std::string RunCapture(const std::wstring &cmdline)
     si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi = {};
     std::wstring cl = cmdline;
-    if (!CreateProcessW(nullptr, &cl[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+    if (!CreateProcessW(nullptr, &cl[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
         { CloseHandle(rd); CloseHandle(wr); return ""; }
     CloseHandle(wr);
     std::string out; char buf[4096]; DWORD n;
@@ -645,7 +865,7 @@ static HANDLE SpawnFfmpeg(const std::wstring &input, double seek, HANDLE *proc)
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
         { CloseHandle(rd); CloseHandle(wr); Log("FAIL: cannot spawn ffmpeg"); return nullptr; }
     CloseHandle(wr);
     CloseHandle(pi.hThread);
@@ -690,7 +910,7 @@ static HANDLE SpawnAudio(const std::wstring &input, double seek, HANDLE *proc)
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
         { CloseHandle(rd); CloseHandle(wr); return nullptr; }
     CloseHandle(wr);
     CloseHandle(pi.hThread);
@@ -751,6 +971,10 @@ static DWORD WINAPI AudioThread(LPVOID)
     HWAVEOUT hwo;
     if (waveOutOpen(&hwo, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
         { g_audio_done = true; return 0; }
+    AcquireSRWLockExclusive(&g_audio_lock);
+    g_wave_out = hwo;
+    if (g_paused) waveOutPause(hwo);
+    ReleaseSRWLockExclusive(&g_audio_lock);
 
     const int NUM = 12;
     const DWORD CHUNK = 4800 * wf.nBlockAlign; // 100 ms
@@ -788,10 +1012,13 @@ static DWORD WINAPI AudioThread(LPVOID)
         if (!refilled) Sleep(5);
     }
 
+    AcquireSRWLockExclusive(&g_audio_lock);
+    g_wave_out = nullptr;
     waveOutReset(hwo);
     for (auto &b : bufs)
         if (b.active) waveOutUnprepareHeader(hwo, &b.h, sizeof(WAVEHDR));
     waveOutClose(hwo);
+    ReleaseSRWLockExclusive(&g_audio_lock);
     return 0;
 }
 
@@ -800,6 +1027,8 @@ static DWORD WINAPI AudioThread(LPVOID)
 // ---------------------------------------------------------------------------
 static void Seek(const std::wstring &input, double t)
 {
+    if (g_duration > 0) t = std::max(0.0, std::min(t, g_duration - 1.0 / g_fps));
+    g_audio_done = true;
     // stop video ffmpeg
     if (g_ffproc) { TerminateProcess(g_ffproc, 0); CloseHandle(g_ffproc); g_ffproc = nullptr; }
     if (g_ffread) { CloseHandle(g_ffread); g_ffread = nullptr; }
@@ -913,13 +1142,17 @@ static void RenderFrame(const uint8_t *nv12)
     bars[nb++] = Trans(g_nr_in.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_list->ResourceBarrier(nb, bars);
 
-    g_params->Set("DLSSNR.Reset", g_frame_index == 0 ? 1 : 0);
-    NVSDK_NGX_Result re;
-    if (g_nr_eval && g_shim_eval)
-        re = g_shim_eval((void *)g_nr_eval, g_list.Get(), g_feature, g_params, nullptr);
-    else
-        re = g_eval(g_list.Get(), g_feature, g_params, nullptr);
-    if (re != NGX_SUCCESS) Log("Evaluate -> 0x%08X", (unsigned)re);
+    bool useNR = g_side || g_nr_enabled;
+    if (useNR) {
+        g_params->Set("DLSSNR.Reset", (g_frame_index == 0 || g_nr_reset) ? 1 : 0);
+        NVSDK_NGX_Result re;
+        if (g_nr_eval && g_shim_eval)
+            re = g_shim_eval((void *)g_nr_eval, g_list.Get(), g_feature, g_params, nullptr);
+        else
+            re = g_eval(g_list.Get(), g_feature, g_params, nullptr);
+        if (re != NGX_SUCCESS) Log("Evaluate -> 0x%08X", (unsigned)re);
+        g_nr_reset = false;
+    }
 
     // nr_out: UAV -> NPSR (cs2 reads); stage/orig: COMMON -> UAV (cs2 writes)
     nb = 0;
@@ -931,7 +1164,7 @@ static void RenderFrame(const uint8_t *nv12)
 
     // cs2: NR output -> stage (right side)
     g_list->SetPipelineState(g_pso_out.Get());
-    g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 3 * inc });      // nr_out SRV
+    g_list->SetComputeRootDescriptorTable(0, { h0.ptr + (useNR ? 3 : 5) * inc }); // NR output or original input
     g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 4 * inc });      // stage UAV
     g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
 
@@ -1058,34 +1291,8 @@ static void DumpFirstFrame()
 // ---------------------------------------------------------------------------
 // wmain
 // ---------------------------------------------------------------------------
-int wmain(int argc, wchar_t **argv)
+static int PlayVideo(const std::wstring &input)
 {
-    std::wstring input;
-    for (int i = 1; i < argc; ++i)
-    {
-        std::wstring a = argv[i];
-        if (a == L"--gpu" && i + 1 < argc) g_gpu_index = _wtoi(argv[++i]);
-        else if (a == L"--style" && i + 1 < argc) { char b[64]; WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, b, 64, nullptr, nullptr); g_style = b; }
-        else if (a == L"--preset" && i + 1 < argc) g_preset = _wtoi(argv[++i]);
-        else if (a == L"--intensity" && i + 1 < argc) g_intensity = _wtoi(argv[++i]);
-        else if (a == L"--tone" && i + 1 < argc) g_tone = _wtoi(argv[++i]);
-        else if (a == L"--structure" && i + 1 < argc) g_structure = _wtoi(argv[++i]);
-        else if (a == L"--skin" && i + 1 < argc) g_skin = _wtoi(argv[++i]);
-        else if (a == L"--mask" && i + 1 < argc) g_mask = _wtoi(argv[++i]);
-        else if (a == L"--fast") g_fast = true;
-        else if (a == L"--nr-only") g_side = false;
-        else if (a == L"--dump" && i + 1 < argc) g_dump_path = argv[++i];
-        else if (a == L"--output" && i + 1 < argc) g_output = argv[++i];
-        else if (a == L"--crf" && i + 1 < argc) g_crf = _wtoi(argv[++i]);
-        else input = a;
-    }
-    if (input.empty()) { Log("usage: nr_player.exe <video> [--gpu N] [--fast] [--output out.mp4] ..."); return 1; }
-    if (!g_output.empty() && g_fast) { Log("note: offline mode (--output) already runs full speed"); }
-
-    // common controls (trackbar)
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
-    InitCommonControlsEx(&icc);
-
     if (!ProbeVideo(input, &g_vid_w, &g_vid_h, &g_fps))
         Fatal("cannot probe video");
     Log("video %ux%u @ %.2f fps", g_vid_w, g_vid_h, g_fps);
@@ -1124,6 +1331,7 @@ int wmain(int argc, wchar_t **argv)
 
     if (!SetupNGX(g_vid_w, g_vid_h)) Fatal("NGX failed");
     if (!SetupCompute()) Fatal("compute failed");
+    g_media_loaded = true;
     if (!SetupWindow(g_vid_w, g_vid_h)) Fatal("window failed");
 
     // readback buffer for --dump / --output
@@ -1172,30 +1380,78 @@ int wmain(int argc, wchar_t **argv)
     UINT64 frames = 0;
     double frame_ms = g_fast ? 0.0 : 1000.0 / g_fps;
     MSG msg;
+    bool have_frame = false;
+    bool pending_frame = false; // paused seek preview, not yet consumed by playback
 
     while (g_running)
     {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
         {
             if (msg.message == WM_QUIT) { g_running = false; break; }
+            if (msg.message == WM_KEYDOWN && msg.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
+            if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D'))
+            {
+                if (!(msg.lParam & (1LL << 30))) {
+                    if (msg.wParam == 'S') ToggleComparison(); else ToggleNR();
+                }
+                continue;
+            }
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_SPACE)
+            {
+                if (!(msg.lParam & (1LL << 30))) TogglePause();
+                continue;
+            }
+            if (msg.message == WM_KEYUP && msg.wParam == VK_SPACE) continue;
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { g_running = false; break; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if (!g_running) break;
+        if (!g_running || !g_open_path.empty()) break;
 
         // handle a pending seek
         if (g_seek_requested)
         {
             Seek(input, g_seek_to);
+            have_frame = false;
+            pending_frame = false;
             g_seek_requested = false;
+            if (g_paused) {
+                if (ReadFrame(g_ffread, frame)) {
+                    RenderFrame(frame.data());
+                    --g_frame_index;
+                    g_nr_reset = true;
+                    have_frame = true;
+                    pending_frame = true;
+                    g_refresh_view = false;
+                    Log("paused seek preview at %.2fs", g_base_time);
+                } else {
+                    Log("No preview frame at %.2fs; playback remains paused", g_base_time);
+                }
+            }
             next_t = (double)GetTickCount64();
             continue;
         }
 
+        if (g_paused)
+        {
+            if (g_refresh_view && have_frame) {
+                RenderFrame(frame.data());
+                --g_frame_index; // redraw the held frame without advancing playback
+                g_nr_reset = true;
+                g_refresh_view = false;
+            }
+            next_t = (double)GetTickCount64();
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 20, QS_ALLINPUT);
+            continue;
+        }
+
         ULONGLONG rt0 = GetTickCount64();
-        if (!ReadFrame(g_ffread, frame)) { Log("EOF"); break; }
+        if (!pending_frame && !ReadFrame(g_ffread, frame)) { Log("EOF"); break; }
+        pending_frame = false;
         g_read_ms += (double)(GetTickCount64() - rt0);
         RenderFrame(frame.data());
+        have_frame = true;
+        g_refresh_view = false;
         ++frames;
 
         // offline: read back the NR output and feed it to the encoder
@@ -1247,13 +1503,113 @@ int wmain(int argc, wchar_t **argv)
     if (g_enc_proc) { WaitForSingleObject(g_enc_proc, 600000); CloseHandle(g_enc_proc); g_enc_proc = nullptr; }
     if (!g_output.empty()) Log("encoded -> %ls", g_output.c_str());
 
-    if (g_ffread) CloseHandle(g_ffread);
-    if (g_ffproc) { TerminateProcess(g_ffproc, 0); CloseHandle(g_ffproc); }
-    if (g_audio_thread) { WaitForSingleObject(g_audio_thread, 2000); CloseHandle(g_audio_thread); }
-    if (g_audio_read) CloseHandle(g_audio_read);
-    if (g_afproc) { TerminateProcess(g_afproc, 0); CloseHandle(g_afproc); }
-    if (g_feature && g_nr_release) { if (g_shim_release) g_shim_release((void *)g_nr_release, g_feature); else g_release(g_feature); }
-    if (g_shutdown) g_shutdown();
     Log("stopped");
     return 0;
+}
+
+static void CleanupPlayback()
+{
+    Log("cleanup: subprocesses");
+    g_audio_done = true;
+    if (g_ffproc) { TerminateProcess(g_ffproc, 0); WaitForSingleObject(g_ffproc, 2000); CloseHandle(g_ffproc); g_ffproc = nullptr; }
+    if (g_afproc) { TerminateProcess(g_afproc, 0); WaitForSingleObject(g_afproc, 2000); CloseHandle(g_afproc); g_afproc = nullptr; }
+    if (g_audio_thread) { WaitForSingleObject(g_audio_thread, INFINITE); CloseHandle(g_audio_thread); g_audio_thread = nullptr; }
+    if (g_ffread) { CloseHandle(g_ffread); g_ffread = nullptr; }
+    if (g_audio_read) { CloseHandle(g_audio_read); g_audio_read = nullptr; }
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) if (g_fence[i]) WaitFence(g_fence[i].Get(), g_fence_value[i]);
+    Log("cleanup: feature");
+    if (g_feature && g_nr_release) {
+        if (g_shim_release) g_shim_release((void *)g_nr_release, g_feature); else g_release(g_feature);
+    }
+    g_feature = nullptr;
+    Log("cleanup: parameters");
+    if (g_params && g_core_module) {
+        auto destroy = (NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter *))GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_DestroyParameters");
+        if (destroy) destroy(g_params);
+    }
+    g_params = nullptr;
+    Log("cleanup: shutdown");
+    if (g_shutdown && g_core_module) g_shutdown();
+    Log("cleanup: resources");
+    g_swap.Reset(); g_readback.Reset();
+    g_pso_in.Reset(); g_pso_out.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
+    g_y_tex.Reset(); g_uv_tex.Reset(); g_staging.Reset(); g_nr_in.Reset();
+    g_nr_out.Reset(); g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_list.Reset();
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        g_cmd_alloc[i].Reset(); g_fence[i].Reset(); g_fence_value[i] = 0;
+    }
+    g_sync_fence.Reset(); g_queue.Reset(); g_dev.Reset(); g_factory2.Reset(); g_factory.Reset();
+    Log("cleanup: modules");
+    // NVIDIA runtime workers must remain loaded for the process lifetime.
+    g_frame_slot = g_last_slot = 0; g_sync_value = g_frame_index = 0;
+    g_base_time = g_duration = 0; g_seek_requested = g_dragging = false;
+    g_nr_reset = true; g_refresh_view = false; g_paused = false; g_audio_done = false;
+    g_read_ms = g_wait_ms = g_upload_ms = 0;
+    g_media_loaded = false;
+    if (IsWindow(g_hwnd)) {
+        SetWindowTextW(g_pause_button, L"Pause");
+        SendMessageW(g_trackbar, TBM_SETPOS, TRUE, 0);
+        SetWindowTextW(g_video_hwnd, L"Drop a video here, or choose File > Open");
+        InvalidateRect(g_video_hwnd, nullptr, TRUE);
+        UpdateModeTitle();
+    }
+}
+
+int wmain(int argc, wchar_t **argv)
+{
+    std::wstring input;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::wstring a = argv[i];
+        if (a == L"--gpu" && i + 1 < argc) g_gpu_index = _wtoi(argv[++i]);
+        else if (a == L"--style" && i + 1 < argc) { char b[64]; WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, b, 64, nullptr, nullptr); g_style = b; }
+        else if (a == L"--preset" && i + 1 < argc) g_preset = _wtoi(argv[++i]);
+        else if (a == L"--intensity" && i + 1 < argc) g_intensity = _wtoi(argv[++i]);
+        else if (a == L"--tone" && i + 1 < argc) g_tone = _wtoi(argv[++i]);
+        else if (a == L"--structure" && i + 1 < argc) g_structure = _wtoi(argv[++i]);
+        else if (a == L"--skin" && i + 1 < argc) g_skin = _wtoi(argv[++i]);
+        else if (a == L"--mask" && i + 1 < argc) g_mask = _wtoi(argv[++i]);
+        else if (a == L"--fast") g_fast = true;
+        else if (a == L"--nr-only") g_side = false;
+        else if (a == L"--side-by-side") g_side = true;
+        else if (a == L"--dump" && i + 1 < argc) g_dump_path = argv[++i];
+        else if (a == L"--output" && i + 1 < argc) g_output = argv[++i];
+        else if (a == L"--crf" && i + 1 < argc) g_crf = _wtoi(argv[++i]);
+        else if (a == L"--gui") g_gui = true;
+        else input = a;
+    }
+    if (input.empty()) g_gui = true;
+    if (!g_output.empty() && g_fast) { Log("note: offline mode (--output) already runs full speed"); }
+
+    // common controls (trackbar)
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icc);
+
+
+    if (g_gui && !SetupWindow(960, 540)) return 1;
+    int result = 0;
+    while (g_running) {
+        if (!input.empty()) {
+            try { result = PlayVideo(input); }
+            catch (const std::exception &error) {
+                result = 1;
+                if (g_gui) MessageBoxA(g_hwnd, error.what(), "Cannot play video", MB_OK | MB_ICONERROR);
+            }
+            CleanupPlayback();
+            input.clear();
+            if (!g_gui && g_open_path.empty()) break;
+        }
+        if (!g_open_path.empty()) { input.swap(g_open_path); continue; }
+        if (!g_running) break;
+        MSG message;
+        int got = GetMessageW(&message, nullptr, 0, 0);
+        if (got <= 0) break;
+        if (message.message == WM_KEYDOWN) {
+            if (message.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
+            if (message.wParam == 'S') { ToggleComparison(); continue; }
+            if (message.wParam == 'D') { ToggleNR(); continue; }
+        }
+        TranslateMessage(&message); DispatchMessageW(&message);
+    }
+    return result;
 }

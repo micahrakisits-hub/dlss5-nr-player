@@ -1,102 +1,123 @@
-# DLSS 5 Neural Rendering — Video Player & Offline Converter
+# DLSS 5 NR Player — desktop player and portable build
 
-Real-time playback and offline conversion of video through **NVIDIA DLSS 5 Neural Rendering** (NR, NGX feature id 18), driven directly through the NGX API. Side-by-side "original | NR" comparison, audio, seek bar, and a file-conversion mode.
+A Windows video player and offline converter based on [Zonnery/dlss5-nr-player](https://github.com/Zonnery/dlss5-nr-player). This fork adds a desktop interface, playback controls, and automatic selection of locally supplied RTX 40/50 neural-rendering runtimes.
 
-> ⚠️ **Personal / experimental project.** It calls NVIDIA's NR model through the raw NGX interface. It runs **only on RTX 50-series (Blackwell) GPUs** and requires a recent NVIDIA driver.
+This repository contains **source code only**. NVIDIA DLLs, the caller helper, FFmpeg, SDK headers, videos, and portable executables are not committed. Obtain runtime dependencies separately under their applicable terms.
 
----
+## Desktop features
 
-## Features
+- Start with an empty player, then use **File → Open**, **Ctrl+O**, or drop a video onto the window.
+- Open another video in the same window. After playback ends, the window stays available for another file.
+- Pause/resume video and audio using the button or **Space**.
+- Click or drag the seek bar to jump to the pointer position. Seeking while paused displays a preview without resuming playback.
+- Resize the window: controls remain visible below the video and wrap to a second row when needed.
+- **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.
+- **DLSS 5** button / **D**: toggle neural processing in single view. DLSS defaults on. Comparison always includes DLSS, so the DLSS toggle is disabled there; returning to single view restores the previous setting.
+- View controls also work while paused. The title shows the current mode. **Esc** closes the player.
+- Build a single-file portable executable containing your locally supplied dependencies. It opens without a batch-file launcher.
 
-- **Real-time NR playback** — decode → NR → window, with a live side-by-side *original | NR* view.
-- **Offline conversion** — process a whole file and write a new video, keeping the original audio.
-- **Hardware decode** — NVDEC (`-hwaccel cuda`) + YUV→RGB conversion on the GPU (no CPU color-conversion bottleneck).
-- **Double-buffered** D3D12 frame loop so CPU decode overlaps GPU NR.
-- Seek bar, audio (waveOut), GPU selection (`--gpu N`).
+## Hardware and validation
 
-## Requirements
+Windows 10/11 x64 and a GeForce RTX 40- or RTX 50-series GPU are required. The player selects a runtime from the **actual DXGI adapter used for rendering**; the `--gpu N` option selects a DXGI adapter index.
 
-- Windows 10/11 64-bit
-- NVIDIA **RTX 50-series** GPU (Blackwell)
-- Recent NVIDIA display driver
-- `ffmpeg` + `ffprobe` on `PATH`
-- MSVC 2019 Build Tools (to build; `vcvars64.bat`)
-
-## Build
-
-Run the `.bat` in a "x64 Native Tools" context (each script calls `vcvars64.bat` itself):
-
-| Script | Output | Links |
+| GPU | Runtime | Validation |
 |---|---|---|
-| `build_player.bat` | `nr_player.exe` (player + offline converter) | `d3d12 dxgi d3dcompiler user32 winmm comctl32` |
-| `build.bat` | `nr_video.exe` (offline PNG→NR→PNG reference) | `d3d12 dxgi windowscodecs ole32` |
-| `build_live.bat` | `nr_live.exe` (screen-capture experiment) | `d3d11 d3d12 dxgi d3dcompiler user32` |
+| RTX 50 series | Original Blackwell NR DLL | Playback tested on RTX 5090 |
+| RTX 40 series, including Ti/Super | Community Ada patch from NR-Media-UI | Selection and packaging tested; actual RTX 40 playback/performance not verified here |
+| Other GPU families | Unsupported | No runtime selected |
 
-The build scripts assume `C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat` — edit if yours differs.
+The RTX40 release README specifies NVIDIA driver **616.56 or newer** and describes its runtime as experimental. Compatibility and real-time performance must be checked on the target card. DLSS-off mode skips neural evaluation, but opening a video still initializes the NGX feature; it is not a fallback for unsupported GPUs.
 
-## Usage
+## Build the native player
 
-**Playback** (double-click `NR_player.bat` to pick a file, or from the command line):
-
-```bat
-nr_player.exe "video.mp4" --gpu 1
-```
-
-**Offline conversion** (processes the file, shows a live preview while it works):
+Install Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK. The script discovers MSVC with `vswhere.exe` instead of hardcoding Visual Studio 2019. A custom installation can be supplied through the `VCVARS64` environment variable.
 
 ```bat
-nr_player.exe "video.mp4" --gpu 1 --style cinematic --preset 3 --intensity 2 --tone 1 --structure 1 --output "output.mp4"
+build_player.bat
 ```
+
+This produces `nr_player.exe`. The player declares its NGX interface inline, so **NVIDIA SDK headers are not required to compile this target**. The compiler links Windows D3D12, DXGI, D3DCompiler, User32, WinMM, Common Controls, Common Dialogs, and Shell32 libraries.
+
+Other build scripts and the DX11 bridge are retained from upstream. They are separate experiments and may have different prerequisites or paths.
+
+## Runtime files to supply locally
+
+Place these files relative to `nr_player.exe`:
+
+| Path | Source / purpose |
+|---|---|
+| `_nvngx.dll` | NGX core from an appropriate installed NVIDIA driver; typically under `C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_*` |
+| `nvngx_dlssnr.dll` | Original RTX50 NR runtime from a legitimate DLSS5 application or the original NR-Media-UI RTX50 release |
+| `runtime40/nvngx_dlssnr.dll` | Community Ada runtime from the author's [NR-Media-UI v1.1.0 RTX40 release](https://github.com/perseval-BLR/NR-Media-UI/releases/tag/v1.1.0) |
+| `caller/nvngx.dll` | Caller wrapper from NR-Media-UI; its PyInstaller executable embeds this helper. It must export `DLSSNR_CallInit`, `DLSSNR_CallCreate`, `DLSSNR_CallEvaluate`, and `DLSSNR_CallRelease`. The driver's ordinary `nvngx.dll` is not a substitute. |
+| `ffmpeg.exe`, `ffprobe.exe` | FFmpeg build with CUDA decoding support, available through [FFmpeg's download page](https://ffmpeg.org/download.html). Native use can also resolve these from PATH. |
+
+The two NR runtimes stay separate; the original RTX50 file is not overwritten with the patch. The selected DLL path is logged. `nvngx_dlss.dll` (Super Resolution) is not used by this player, although the upstream DX11 bridge uses it.
+
+For reference, the RTX40 archive used during integration was `NR-Media-UI-v1.1.0-RTX40.zip`, SHA-256 `90cc641f987a5c6302d6c05d09c0de235b7567c95c03114a2a407dbeffc9c233` (verified against release metadata). Its NR DLL hash was `28bdc080d28686decdb63f6f4246b022274916b80aafdab266fe0fb63b2b9265`. This records provenance; it does not establish redistribution rights or guarantee compatibility.
+
+## Run
+
+Start the empty desktop player:
+
+```bat
+nr_player.exe
+```
+
+Play a file and keep the GUI available afterward:
+
+```bat
+nr_player.exe --gui "video.mp4"
+```
+
+Without `--gui`, a command-line input exits at EOF. The legacy `NR_player.bat` file picker remains available.
 
 ### Options
 
-| Flag | Meaning |
+| Option | Meaning |
 |---|---|
-| `--gpu N` | DXGI adapter index (0 = first NVIDIA, etc.) |
+| `--gpu N` | DXGI adapter index |
+| `--nr-only` | Single view (default) |
+| `--side-by-side` | Start in comparison view |
 | `--style natural\|cinematic` | NR style |
-| `--preset N` | render preset (default 3) |
-| `--intensity N` / `--tone N` / `--structure N` | NR strength sliders |
-| `--skin N` / `--mask N` | skin structure / auto-mask |
-| `--fast` | no frame pacing (max throughput, benchmark) |
-| `--nr-only` | hide the side-by-side "original" half |
-| `--output out.mp4` | offline mode: encode the NR result to a file |
-| `--crf N` | x264 CRF for `--output` (default 18) |
-| `--dump file.rgba` | dump the first NR frame as tight RGBA |
+| `--preset N` | Render preset (default 3) |
+| `--intensity N`, `--tone N`, `--structure N` | NR tuning |
+| `--skin N`, `--mask N` | Skin structure / automatic mask |
+| `--fast` | Disable frame pacing |
+| `--output out.mp4` | Offline conversion with original audio |
+| `--crf N` | Output H.264 CRF (default 18) |
+| `--dump frame.rgba` | Dump the first processed frame |
 
-## How it works (short version)
+## Build your local portable executable
 
-`ffmpeg -hwaccel cuda -f rawvideo -pix_fmt nv12` feeds raw NV12 into the player → uploaded to the GPU → a compute shader converts NV12→RGBA16F (BT.709 limited range) → DLSS 5 NR (`nvngx_dlssnr.dll`, feature 18) → back to RGBA8 → swapchain. Offline mode adds a readback of each NR frame and pipes it into a second `ffmpeg` (libx264) that muxes the original audio.
+After building the native player and supplying all files in the runtime table (including both NR runtimes), install Python and PyInstaller in a build environment:
 
-Key detail: the NR path needs an exact NGX init (`NVSDK_NGX_D3D12_Init_ProjectID`) and a small **caller-validation shim** (`caller/nvngx.dll`) — the NR DLL rejects direct calls from unknown callers (`0xBAD00002`).
+```bat
+python -m pip install pyinstaller
+python build_portable.py
+```
 
----
+The result is `dist/DLSS 5 NR Player.exe`. `--dist-dir PATH` selects another output directory. Paths resolve relative to the packaging script, so it can be invoked from another working directory. The script reports missing dependencies and does not download them automatically.
 
-## ⚠️ Files you must provide yourself (NOT in this repo)
+The portable launcher extracts its payload to a temporary directory, launches the native GUI without a console, and waits until it closes before cleanup. No installed Python, FFmpeg, or source checkout is needed on the target computer. A compatible GPU and driver are still necessary. Diagnostics are written to `%TEMP%\DLSS5-NR-Player.log`.
 
-NVIDIA's binaries and the NGX SDK headers are **not redistributable** and are intentionally absent from this repository. Download/extract them yourself and place them next to the sources before building/running:
+The packaging recipe is for your local dependencies. Check the applicable licenses before sharing a package containing NVIDIA or other third-party binaries. This fork does not publish those binaries.
 
-| File | What it is | Where to get it |
-|---|---|---|
-| `_nvngx.dll` | NGX core runtime | NVIDIA display driver — `C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_*\` (the hash dir varies per driver version) |
-| `nvngx_dlssnr.dll` | DLSS 5 Neural Rendering runtime | Ships with the driver and with DLSS-5 apps; the [NR-Media-UI](https://youtube.com/@perseval_BLR) release bundles it |
-| `nvngx_dlss.dll` | DLSS Super Resolution (only needed by the DX11 bridge) | Any DLSS-enabled game's install dir, or the NVIDIA DLSS SDK |
-| `nvsdk_ngx.h` / `nvsdk_ngx_defs.h` / `nvsdk_ngx_helpers.h` / `nvsdk_ngx_params.h` | NGX SDK headers | NVIDIA NGX SDK — [Streamline](https://github.com/NVIDIAGameWorks/Streamline) or the DLSS SDK at [developer.nvidia.com](https://developer.nvidia.com/rtx/dlss) |
-| `caller/nvngx.dll` | caller-validation shim (thin wrapper) | Bundled with [NR-Media-UI](https://youtube.com/@perseval_BLR). Prefer committing its **source** (a few thin wrappers) if you have it, not the binary |
-| `ffmpeg.exe` / `ffprobe.exe` | decode / encode / probe | [ffmpeg.org](https://ffmpeg.org/download.html), `winget install ffmpeg`, or `choco install ffmpeg` |
+## Validation
 
-> The shim (`caller/nvngx.dll`) is a small helper DLL that exports thin wrappers so the NR runtime's caller-validation passes. It is **required** at runtime; keep it out of the repo unless you have redistributable source.
+From an x64 Native Tools command prompt:
 
-## Repo contents (what's actually ours)
+```bat
+cl /nologo /EHsc /std:c++17 /Fe:runtime_selection_test.exe tests\runtime_selection.cpp
+runtime_selection_test.exe
+```
 
-- `nr_player.cpp` — the player + offline converter (main deliverable)
-- `nr_video.cpp` — offline PNG→NR→PNG reference pipeline
-- `nr_live.cpp` — screen-capture experiment
-- `build.bat` / `build_live.bat` / `build_player.bat` — MSVC build scripts
-- `NR_player.bat` — launcher with a file-open dialog
-- `bridge.h` / `bridge.inc` / `dlss5-dx11-bridge.cpp` / `version.rc` — the **DLSS 5 DX11 Bridge** for ReShade (a separate, games-oriented sub-project)
+The test checks runtime selection for RTX40, RTX50, Ti/Super/laptop variants, and unsupported adapters. Integration checks performed on RTX5090 covered playback, buttons and hotkeys, paused seeking, resize, file-open/replacement, file-drop handling, EOF/reopen, and the portable package. RTX40 hardware playback remains untested.
 
-Everything else in the working directory (`.exe`, `.obj`, `.mp4`, `.rgba`, `.png`, `bench_*`, `test_*`, `real_*`, logs) is build output or test data and is excluded via `.gitignore`.
+## Credits and scope
 
-## Legal
+- Original player, conversion pipeline, NGX integration and experiments: [Zonnery/dlss5-nr-player](https://github.com/Zonnery/dlss5-nr-player).
+- Runtime/helper release source: [perseval-BLR/NR-Media-UI](https://github.com/perseval-BLR/NR-Media-UI). Its RTX40 README credits the community patch to Uncle Burrito / dev-camo.
+- NVIDIA DLSS/NGX names and binaries belong to NVIDIA and remain subject to their own terms.
 
-This project is a personal experiment. NVIDIA DLSS, NGX, and the `nvngx_*` / `_nvngx.dll` binaries are NVIDIA Corporation property and are governed by their own licenses — do not redistribute them. Use this code at your own risk.
+This is an experimental community project. Upstream history and attribution are preserved; this fork does not add a new license grant for upstream or third-party material.
