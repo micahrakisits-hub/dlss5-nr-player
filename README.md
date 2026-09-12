@@ -9,6 +9,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - Start with an empty player, then use **File → Open**, **Ctrl+O**, or drop a video onto the window.
 - Open another video in the same window. After playback ends, the window stays available for another file.
 - Pause/resume video and audio using the button or **Space**.
+- Step one frame backward or forward with the **Previous Frame** / **Next Frame** buttons or the **Left** / **Right Arrow** keys. Stepping pauses playback and displays the selected frame.
 - Click or drag the seek bar to jump to the pointer position. Seeking while paused displays a preview without resuming playback.
 - Resize the window: controls remain visible below the video and wrap to a second row when needed.
 - **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.

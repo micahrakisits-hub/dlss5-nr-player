@@ -168,6 +168,7 @@ static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
+static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
 static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
@@ -205,6 +206,7 @@ static volatile bool g_audio_done = false;
 // seek / progress bar state
 static double g_duration = 0.0;      // video duration (seconds)
 static double g_base_time = 0.0;     // seek offset (seconds)
+static double g_current_time = 0.0;  // timestamp of the displayed frame
 static volatile double g_seek_to = 0.0;
 static volatile bool g_seek_requested = false;
 static bool g_dragging = false;
@@ -625,7 +627,8 @@ static void UpdateModeTitle()
                          (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original"));
     std::wstring title = L"DLSS5 NR player - ";
     title += mode;
-    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | M: model | Space: pause]" : L"  [Space: pause]";
+    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | M: model | Left/Right: frame]" :
+                              L"  [Left/Right: frame | Space: pause]";
     SetWindowTextW(g_hwnd, title.c_str());
     SetWindowTextW(g_split_button, !g_nr_available ? L"Split: N/A" : (g_side ? L"Split: ON" : L"Split: OFF"));
     SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -638,6 +641,8 @@ static void UpdateModeTitle()
     EnableWindow(g_dlss_button, g_nr_available && !g_side);
     EnableWindow(g_model_button, g_nr_available);
     EnableWindow(g_pause_button, g_media_loaded);
+    EnableWindow(g_prev_frame_button, g_media_loaded);
+    EnableWindow(g_next_frame_button, g_media_loaded);
     EnableWindow(g_trackbar, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
     Log("view: %s", !g_nr_available ? "Original (DLSS 5 unavailable)" :
@@ -698,6 +703,24 @@ static void TogglePause()
     Log("%s at frame %llu", g_paused ? "paused" : "resumed", (unsigned long long)g_frame_index);
 }
 
+static void RequestFrameStep(int direction)
+{
+    if (!g_media_loaded || g_fps <= 0.0 || direction == 0) return;
+    if (!g_paused) TogglePause();
+
+    double origin = g_seek_requested ? g_seek_to : g_current_time;
+    double lastFrame = g_duration > 0.0 ? std::max(0.0, g_duration - 1.0 / g_fps) : origin + 1.0 / g_fps;
+    g_seek_to = std::max(0.0, std::min(lastFrame, origin + direction / g_fps));
+    g_seek_requested = true;
+    g_last_seek_tick = GetTickCount64();
+    if (g_trackbar && g_duration > 0.0)
+    {
+        int pos = (int)(g_seek_to / g_duration * 1000.0);
+        SendMessageW(g_trackbar, TBM_SETPOS, TRUE, pos);
+    }
+    Log("frame step %s -> %.3fs", direction < 0 ? "back" : "forward", (double)g_seek_to);
+}
+
 static void SeekAtMouse(HWND hwnd, LPARAM lp, WORD notification)
 {
     RECT channel, thumb;
@@ -750,14 +773,16 @@ static void LayoutControls(HWND hwnd)
 {
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
-    bool stacked = width < 720;
+    bool stacked = width < 780;
     int videoHeight = std::max(1, height - (stacked ? 76 : 40));
     if (g_video_hwnd) MoveWindow(g_video_hwnd, 0, 0, width, videoHeight, TRUE);
-    if (g_pause_button) MoveWindow(g_pause_button, 6, videoHeight + 6, 80, 28, TRUE);
-    if (g_split_button) MoveWindow(g_split_button, 92, videoHeight + 6, 100, 28, TRUE);
-    if (g_dlss_button) MoveWindow(g_dlss_button, 198, videoHeight + 6, 100, 28, TRUE);
-    if (g_model_button) MoveWindow(g_model_button, stacked ? 6 : 304, videoHeight + (stacked ? 42 : 6), 130, 28, TRUE);
-    int seekX = stacked ? 142 : 440;
+    if (g_pause_button) MoveWindow(g_pause_button, 6, videoHeight + 6, 72, 28, TRUE);
+    if (g_prev_frame_button) MoveWindow(g_prev_frame_button, 84, videoHeight + 6, 64, 28, TRUE);
+    if (g_next_frame_button) MoveWindow(g_next_frame_button, 154, videoHeight + 6, 64, 28, TRUE);
+    if (g_split_button) MoveWindow(g_split_button, 224, videoHeight + 6, 90, 28, TRUE);
+    if (g_dlss_button) MoveWindow(g_dlss_button, stacked ? 6 : 320, videoHeight + (stacked ? 42 : 6), 100, 28, TRUE);
+    if (g_model_button) MoveWindow(g_model_button, stacked ? 112 : 426, videoHeight + (stacked ? 42 : 6), 130, 28, TRUE);
+    int seekX = stacked ? 248 : 562;
     if (g_trackbar) MoveWindow(g_trackbar, seekX, videoHeight + (stacked ? 42 : 6), std::max(1, width - seekX - 6), 28, TRUE);
 }
 
@@ -788,6 +813,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if (LOWORD(wp) == 1001) { OpenVideoDialog(hwnd); return 0; }
         if (LOWORD(wp) == 1002) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
         if ((HWND)lp == g_pause_button && HIWORD(wp) == BN_CLICKED) { TogglePause(); return 0; }
+        if ((HWND)lp == g_prev_frame_button && HIWORD(wp) == BN_CLICKED) { RequestFrameStep(-1); return 0; }
+        if ((HWND)lp == g_next_frame_button && HIWORD(wp) == BN_CLICKED) { RequestFrameStep(1); return 0; }
         if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
@@ -854,7 +881,11 @@ static bool SetupWindow(UINT w, UINT h)
     g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                                   0, 0, dw, h, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                    0, 0, 80, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+                                    0, 0, 72, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_prev_frame_button = CreateWindowExW(0, L"BUTTON", L"\x25C0 Frame", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                         0, 0, 64, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_next_frame_button = CreateWindowExW(0, L"BUTTON", L"Frame \x25B6", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                         0, 0, 64, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     DWORD toggleStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_CHECKBOX | BS_PUSHLIKE;
     g_split_button = CreateWindowExW(0, L"BUTTON", L"Split: OFF", toggleStyle,
                                     0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
@@ -866,7 +897,8 @@ static bool SetupWindow(UINT w, UINT h)
     g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
-    if (!g_video_hwnd || !g_pause_button || !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar) return false;
+    if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
+        !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
     LayoutControls(g_hwnd);
     }
@@ -1321,6 +1353,7 @@ static void RenderFrame(const uint8_t *nv12)
     g_queue->Signal(g_fence[slot].Get(), ++g_fence_value[slot]);
     g_swap->Present((g_fast || !g_output.empty()) ? 0 : 1, 0);
     ++g_frame_index;
+    g_current_time = g_base_time + (double)(g_frame_index - 1) / g_fps;
     g_last_slot = slot;
     g_frame_slot = (slot + 1) % FRAMES_IN_FLIGHT;
 }
@@ -1488,6 +1521,11 @@ static int PlayVideo(const std::wstring &input)
                 if (!(msg.lParam & (1LL << 30))) TogglePause();
                 continue;
             }
+            if (msg.message == WM_KEYDOWN && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
+            {
+                if (!(msg.lParam & (1LL << 30))) RequestFrameStep(msg.wParam == VK_LEFT ? -1 : 1);
+                continue;
+            }
             if (msg.message == WM_KEYUP && msg.wParam == VK_SPACE) continue;
             if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { g_running = false; break; }
             TranslateMessage(&msg);
@@ -1560,8 +1598,7 @@ static int PlayVideo(const std::wstring &input)
         // advance the seek bar (only when not dragging)
         if (!g_dragging && g_trackbar && g_duration > 0)
         {
-            double cur = g_base_time + (double)g_frame_index / g_fps;
-            int pos = (int)(cur / g_duration * 1000.0);
+            int pos = (int)(g_current_time / g_duration * 1000.0);
             SendMessageW(g_trackbar, TBM_SETPOS, TRUE, pos);
         }
 
@@ -1618,7 +1655,7 @@ static void CleanupPlayback()
     Log("cleanup: modules");
     // NVIDIA runtime workers must remain loaded for the process lifetime.
     g_frame_slot = g_last_slot = 0; g_sync_value = g_frame_index = 0;
-    g_base_time = g_duration = 0; g_seek_requested = g_dragging = false;
+    g_base_time = g_current_time = g_duration = 0; g_seek_requested = g_dragging = false;
     g_nr_reset = true; g_refresh_view = false; g_paused = false; g_audio_done = false;
     g_read_ms = g_wait_ms = g_upload_ms = 0;
     g_media_loaded = false;
@@ -1685,6 +1722,8 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'S') { ToggleComparison(); continue; }
             if (message.wParam == 'D') { ToggleNR(); continue; }
             if (message.wParam == 'M') { CycleModel(); continue; }
+            if (message.wParam == VK_LEFT) { RequestFrameStep(-1); continue; }
+            if (message.wParam == VK_RIGHT) { RequestFrameStep(1); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
