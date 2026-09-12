@@ -38,6 +38,18 @@ int main()
     HWND controls[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_dlss_button, g_model_button, g_mute_button,
         g_volume_label, g_volume_slider, g_trackbar};
+    RECT initial[10], restored[10];
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 960, 400, SWP_NOMOVE | SWP_NOZORDER);
+    LayoutControls(g_hwnd);
+    for (int i = 0; i < 10; ++i) GetWindowRect(controls[i], &initial[i]);
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 320, 300, SWP_NOMOVE | SWP_NOZORDER);
+    LayoutControls(g_hwnd);
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 960, 400, SWP_NOMOVE | SWP_NOZORDER);
+    LayoutControls(g_hwnd);
+    for (int i = 0; i < 10; ++i) {
+        GetWindowRect(controls[i], &restored[i]);
+        assert(EqualRect(&initial[i], &restored[i]));
+    }
     for (int width : {320, 640, 960}) {
         SetWindowPos(g_hwnd, nullptr, 0, 0, width, 300, SWP_NOMOVE | SWP_NOZORDER);
         LayoutControls(g_hwnd);
@@ -74,5 +86,5 @@ int main()
     GetWindowRect(g_video_hwnd, &player);
     assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 32) <= 32);
     DestroyWindow(g_hwnd);
-    puts("PASS: audio controls, responsive layout, and aspect-ratio fitting");
+    puts("PASS: audio controls, reversible responsive layout, and aspect-ratio fitting");
 }

@@ -850,15 +850,33 @@ static void LayoutControls(HWND hwnd)
     UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
-    if (g_video_hwnd) MoveWindow(g_video_hwnd, video.left, video.top,
-        video.right - video.left, video.bottom - video.top, TRUE);
+    struct Placement { HWND window; int x, y, width, height; };
+    Placement placements[11];
+    int count = 0;
+    placements[count++] = {g_video_hwnd, video.left, video.top,
+        video.right - video.left, video.bottom - video.top};
     for (int i = 0; i < 6; ++i)
-        if (buttons[i].window) MoveWindow(buttons[i].window, positions[i].x,
-            videoHeight + positions[i].y, buttons[i].width, 28, TRUE);
-    if (g_mute_button) MoveWindow(g_mute_button, audio.x, videoHeight + audio.y, 70, 28, TRUE);
-    if (g_volume_label) MoveWindow(g_volume_label, audio.x + 76, videoHeight + audio.y + 6, 88, 22, TRUE);
-    if (g_volume_slider) MoveWindow(g_volume_slider, audio.x + 164, videoHeight + audio.y, 116, 28, TRUE);
-    if (g_trackbar) MoveWindow(g_trackbar, 6, videoHeight + seekY, std::max(1, width - 12), 28, TRUE);
+        placements[count++] = {buttons[i].window, positions[i].x,
+            videoHeight + positions[i].y, buttons[i].width, 28};
+    placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, 70, 28};
+    placements[count++] = {g_volume_label, audio.x + 76, videoHeight + audio.y + 6, 88, 22};
+    placements[count++] = {g_volume_slider, audio.x + 164, videoHeight + audio.y, 116, 28};
+    placements[count++] = {g_trackbar, 6, videoHeight + seekY, std::max(1, width - 12), 28};
+
+    HDWP batch = BeginDeferWindowPos(count);
+    for (int i = 0; batch && i < count; ++i)
+        if (placements[i].window)
+            batch = DeferWindowPos(batch, placements[i].window, nullptr,
+                placements[i].x, placements[i].y, placements[i].width, placements[i].height,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+    if (batch) EndDeferWindowPos(batch);
+    else for (int i = 0; i < count; ++i)
+        if (placements[i].window)
+            SetWindowPos(placements[i].window, nullptr,
+                placements[i].x, placements[i].y, placements[i].width, placements[i].height,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 static void OpenVideoDialog(HWND hwnd)
