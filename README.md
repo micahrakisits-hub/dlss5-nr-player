@@ -12,7 +12,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - Set playback volume from **0–100%**, or use **Mute / Unmute** without losing the chosen level. Volume and mute carry across seeks and video changes until the app closes. These controls do not change exported audio.
 - Step one frame backward or forward with the **Previous Frame** / **Next Frame** buttons or the **Left** / **Right Arrow** keys. Stepping pauses playback and displays the selected frame.
 - Click or drag the seek bar to jump to the pointer position. Seeking while paused displays a preview without resuming playback.
-- Resize the window: controls remain visible below the video and wrap to a second row when needed.
+- Resize the window: the video keeps its original aspect ratio with black letterbox or pillarbox bars, while controls remain visible below it and wrap when needed.
 - **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.
 - **DLSS 5** button / **D**: toggle neural processing in single view. DLSS defaults on. Comparison always includes DLSS, so the DLSS toggle is disabled there; returning to single view restores the previous setting.
 - **Model** button / **M**: cycle between the Default, Natural, and Cinematic DLSS 5 models. The new model is applied immediately and also works while paused.
@@ -41,7 +41,7 @@ Install Visual Studio Build Tools with **Desktop development with C++** and a Wi
 build_player.bat
 ```
 
-This produces `nr_player.exe`. The player declares its NGX interface inline, so **NVIDIA SDK headers are not required to compile this target**. The compiler links Windows D3D12, DXGI, D3DCompiler, User32, WinMM, Common Controls, Common Dialogs, and Shell32 libraries.
+This produces `nr_player.exe`. The player declares its NGX interface inline, so **NVIDIA SDK headers are not required to compile this target**. The compiler links Windows D3D12, DXGI, D3DCompiler, User32, GDI32, WinMM, Common Controls, Common Dialogs, and Shell32 libraries.
 
 Other build scripts and the DX11 bridge are retained from upstream. They are separate experiments and may have different prerequisites or paths.
 

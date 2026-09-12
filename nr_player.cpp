@@ -206,6 +206,8 @@ static HANDLE g_audio_read = nullptr;
 static HANDLE g_audio_thread = nullptr;
 static volatile bool g_audio_done = false;
 
+static void LayoutControls(HWND hwnd);
+
 // seek / progress bar state
 static double g_duration = 0.0;      // video duration (seconds)
 static double g_base_time = 0.0;     // seek offset (seconds)
@@ -665,6 +667,7 @@ static void ToggleComparison()
     g_side = side;
     g_nr_reset = true;
     g_refresh_view = true;
+    LayoutControls(g_hwnd);
     UpdateModeTitle();
 }
 
@@ -807,6 +810,23 @@ static LRESULT CALLBACK SeekBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
     return DefSubclassProc(hwnd, message, wp, lp);
 }
 
+static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT contentHeight)
+{
+    RECT result = {0, 0, std::max(1, areaWidth), std::max(1, areaHeight)};
+    if (!contentWidth || !contentHeight || areaWidth <= 0 || areaHeight <= 0) return result;
+
+    if ((long long)areaWidth * contentHeight > (long long)areaHeight * contentWidth) {
+        int width = std::max(1, (int)((long long)areaHeight * contentWidth / contentHeight));
+        result.left = (areaWidth - width) / 2;
+        result.right = result.left + width;
+    } else {
+        int height = std::max(1, (int)((long long)areaWidth * contentHeight / contentWidth));
+        result.top = (areaHeight - height) / 2;
+        result.bottom = result.top + height;
+    }
+    return result;
+}
+
 static void LayoutControls(HWND hwnd)
 {
     RECT r; GetClientRect(hwnd, &r);
@@ -827,7 +847,11 @@ static void LayoutControls(HWND hwnd)
     POINT audio = place(280);
     int seekY = (row + 1) * 36 + 6;
     int videoHeight = std::max(1, height - (seekY + 34));
-    if (g_video_hwnd) MoveWindow(g_video_hwnd, 0, 0, width, videoHeight, TRUE);
+    UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
+    UINT contentHeight = g_media_loaded ? g_vid_h : 0;
+    RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
+    if (g_video_hwnd) MoveWindow(g_video_hwnd, video.left, video.top,
+        video.right - video.left, video.bottom - video.top, TRUE);
     for (int i = 0; i < 6; ++i)
         if (buttons[i].window) MoveWindow(buttons[i].window, positions[i].x,
             videoHeight + positions[i].y, buttons[i].width, 28, TRUE);
@@ -916,6 +940,7 @@ static bool SetupWindow(UINT w, UINT h)
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"nr_player";
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassExW(&wc);
 
     DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
@@ -978,6 +1003,7 @@ static bool SetupWindow(UINT w, UINT h)
         return true;
     }
     SetWindowTextW(g_video_hwnd, L"");
+    LayoutControls(g_hwnd);
 
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.Width = g_side ? w * 2 : w; sd.Height = h;
@@ -1733,6 +1759,7 @@ static void CleanupPlayback()
         SetWindowTextW(g_video_hwnd, L"Drop a video here, or choose File > Open");
         InvalidateRect(g_video_hwnd, nullptr, TRUE);
         UpdateModeTitle();
+        LayoutControls(g_hwnd);
     }
 }
 

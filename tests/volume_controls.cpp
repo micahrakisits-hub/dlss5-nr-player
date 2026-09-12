@@ -53,6 +53,26 @@ int main()
             }
         }
     }
+
+    RECT fitted = FitVideoRect(1000, 600, 1920, 1080);
+    assert(fitted.left == 0 && fitted.right == 1000);
+    assert(fitted.top == 19 && fitted.bottom == 581);
+    fitted = FitVideoRect(1000, 600, 3840, 1080);
+    assert(fitted.left == 0 && fitted.right == 1000);
+    assert(fitted.top == 159 && fitted.bottom == 440);
+    fitted = FitVideoRect(1000, 600, 1080, 1920);
+    assert(fitted.top == 0 && fitted.bottom == 600);
+    assert(fitted.left == 331 && fitted.right == 668);
+
+    g_media_loaded = true; g_vid_w = 1920; g_vid_h = 1080; g_side = false;
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 1000, 700, SWP_NOMOVE | SWP_NOZORDER);
+    LayoutControls(g_hwnd);
+    RECT player; GetWindowRect(g_video_hwnd, &player);
+    assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 16) <= 16);
+    g_side = true;
+    LayoutControls(g_hwnd);
+    GetWindowRect(g_video_hwnd, &player);
+    assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 32) <= 32);
     DestroyWindow(g_hwnd);
-    puts("PASS: slider/mute dispatch, stereo output levels, retained settings, independent seek, responsive layout");
+    puts("PASS: audio controls, responsive layout, and aspect-ratio fitting");
 }
