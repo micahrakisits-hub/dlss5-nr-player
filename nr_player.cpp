@@ -916,6 +916,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
         if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
+        if ((HWND)lp == g_video_hwnd && HIWORD(wp) == STN_CLICKED) { TogglePause(); return 0; }
         break;
     case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
     case WM_DROPFILES:
@@ -981,7 +982,7 @@ static bool SetupWindow(UINT w, UINT h)
     SetMenu(g_hwnd, menu);
     DragAcceptFiles(g_hwnd, TRUE);
 
-    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY,
                                   0, 0, dw, h, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                     0, 0, 72, 28, g_hwnd, nullptr, wc.hInstance, nullptr);

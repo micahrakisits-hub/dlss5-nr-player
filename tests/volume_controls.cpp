@@ -47,6 +47,15 @@ int main()
     waveOutClose(g_wave_out);
     g_wave_out = nullptr;
 
+    g_media_loaded = true;
+    g_paused = false;
+    assert(GetWindowLongPtrW(g_video_hwnd, GWL_STYLE) & SS_NOTIFY);
+    WndProc(g_hwnd, WM_COMMAND, MAKEWPARAM(0, STN_CLICKED), (LPARAM)g_video_hwnd);
+    assert(g_paused);
+    WndProc(g_hwnd, WM_COMMAND, MAKEWPARAM(0, STN_CLICKED), (LPARAM)g_video_hwnd);
+    assert(!g_paused);
+    g_media_loaded = false;
+
     HWND controls[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_dlss_button, g_model_button, g_mute_button,
         g_volume_label, g_volume_slider, g_trackbar};
@@ -98,5 +107,5 @@ int main()
     GetWindowRect(g_video_hwnd, &player);
     assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 32) <= 32);
     DestroyWindow(g_hwnd);
-    puts("PASS: audio controls, reversible responsive layout, and aspect-ratio fitting");
+    puts("PASS: audio/video click controls, reversible responsive layout, and aspect-ratio fitting");
 }
