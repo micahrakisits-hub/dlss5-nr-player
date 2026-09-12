@@ -9,6 +9,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - Start with an empty player, then use **File → Open**, **Ctrl+O**, or drop a video onto the window.
 - Open another video in the same window. After playback ends, the window stays available for another file.
 - Pause/resume video and audio by clicking the video, using the button, or pressing **Space**.
+- Use the **Fullscreen** button or **F11** for fullscreen playback. Press **Esc** or **F11** to return to the normal window.
 - Set playback volume from **0–100%**, or use **Mute / Unmute** without losing the chosen level. Volume and mute carry across seeks and video changes until the app closes. These controls do not change exported audio.
 - Step one frame backward or forward with the **Previous Frame** / **Next Frame** buttons or the **Left** / **Right Arrow** keys. Stepping pauses playback and displays the selected frame.
 - Click or drag the seek bar to jump to the pointer position. Seeking while paused displays a preview without resuming playback.

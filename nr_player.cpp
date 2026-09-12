@@ -170,6 +170,7 @@ static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
 static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
+static HWND g_fullscreen_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
 static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
@@ -181,6 +182,10 @@ static SRWLOCK g_audio_lock = SRWLOCK_INIT;
 static HWAVEOUT g_wave_out = nullptr;
 static int g_volume = 100;
 static bool g_muted = false;
+static bool g_fullscreen = false;
+static DWORD g_windowed_style = 0;
+static WINDOWPLACEMENT g_windowed_placement = {sizeof(WINDOWPLACEMENT)};
+static HMENU g_windowed_menu = nullptr;
 
 static UINT g_vid_w = 0, g_vid_h = 0;
 static UINT g_row_pitch = 0;
@@ -649,6 +654,7 @@ static void UpdateModeTitle()
     EnableWindow(g_prev_frame_button, g_media_loaded);
     EnableWindow(g_next_frame_button, g_media_loaded);
     EnableWindow(g_trackbar, g_media_loaded);
+    EnableWindow(g_fullscreen_button, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
     Log("view: %s", !g_nr_available ? "Original (DLSS 5 unavailable)" :
          (g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original")));
@@ -827,16 +833,59 @@ static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT 
     return result;
 }
 
+static void ToggleFullscreen()
+{
+    if (!g_hwnd || (!g_fullscreen && !g_media_loaded)) return;
+    if (!g_fullscreen) {
+        MONITORINFO monitor = {sizeof(monitor)};
+        if (!GetWindowPlacement(g_hwnd, &g_windowed_placement) ||
+            !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+        g_windowed_style = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+        g_windowed_menu = GetMenu(g_hwnd);
+        g_fullscreen = true;
+        SetMenu(g_hwnd, nullptr);
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, g_windowed_style & ~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(g_hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right - monitor.rcMonitor.left,
+            monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        g_fullscreen = false;
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, g_windowed_style);
+        SetMenu(g_hwnd, g_windowed_menu);
+        SetWindowPlacement(g_hwnd, &g_windowed_placement);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+            SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        DrawMenuBar(g_hwnd);
+    }
+    LayoutControls(g_hwnd);
+}
+
 static void LayoutControls(HWND hwnd)
 {
     const int muteWidth = 70, volumeLabelWidth = 100, volumeSliderWidth = 110;
     const int audioWidth = muteWidth + 6 + volumeLabelWidth + 6 + volumeSliderWidth;
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
+    HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
+        g_split_button, g_dlss_button, g_model_button, g_fullscreen_button,
+        g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+    if (g_fullscreen) {
+        for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
+        UINT contentWidth = g_vid_w * (g_side ? 2u : 1u);
+        RECT video = FitVideoRect(width, height, contentWidth, g_vid_h);
+        SetWindowPos(g_video_hwnd, nullptr, video.left, video.top,
+            video.right - video.left, video.bottom - video.top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        return;
+    }
+    for (HWND control : chrome) if (control) ShowWindow(control, SW_SHOW);
     struct Control { HWND window; int width; };
     Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
         {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
-        {g_model_button, 130}};
+        {g_model_button, 130}, {g_fullscreen_button, 88}};
     int x = 6, row = 0;
     auto place = [&](int controlWidth) {
         if (x > 6 && x + controlWidth > width - 6) { x = 6; ++row; }
@@ -844,8 +893,8 @@ static void LayoutControls(HWND hwnd)
         x += controlWidth + 6;
         return pos;
     };
-    POINT positions[6];
-    for (int i = 0; i < 6; ++i) positions[i] = place(buttons[i].width);
+    POINT positions[7];
+    for (int i = 0; i < 7; ++i) positions[i] = place(buttons[i].width);
     POINT audio = place(audioWidth);
     int seekY = (row + 1) * 36 + 6;
     int videoHeight = std::max(1, height - (seekY + 34));
@@ -853,11 +902,11 @@ static void LayoutControls(HWND hwnd)
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
     struct Placement { HWND window; int x, y, width, height; };
-    Placement placements[11];
+    Placement placements[12];
     int count = 0;
     placements[count++] = {g_video_hwnd, video.left, video.top,
         video.right - video.left, video.bottom - video.top};
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 7; ++i)
         placements[count++] = {buttons[i].window, positions[i].x,
             videoHeight + positions[i].y, buttons[i].width, 28};
     placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, muteWidth, 28};
@@ -917,8 +966,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
         if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
         if ((HWND)lp == g_video_hwnd && HIWORD(wp) == STN_CLICKED) { TogglePause(); return 0; }
+        if ((HWND)lp == g_fullscreen_button && HIWORD(wp) == BN_CLICKED) { ToggleFullscreen(); return 0; }
         break;
-    case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_F11) { ToggleFullscreen(); return 0; }
+        if (wp == VK_ESCAPE) {
+            if (g_fullscreen) ToggleFullscreen(); else g_running = false;
+            return 0;
+        }
+        break;
     case WM_DROPFILES:
     {
         HDROP drop = (HDROP)wp;
@@ -997,6 +1053,8 @@ static bool SetupWindow(UINT w, UINT h)
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_fullscreen_button = CreateWindowExW(0, L"BUTTON", L"Fullscreen", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                         0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE,
@@ -1013,7 +1071,7 @@ static bool SetupWindow(UINT w, UINT h)
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar ||
-        !g_mute_button || !g_volume_label || !g_volume_slider) return false;
+        !g_mute_button || !g_volume_label || !g_volume_slider || !g_fullscreen_button) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
     LayoutControls(g_hwnd);
     }
@@ -1644,7 +1702,14 @@ static int PlayVideo(const std::wstring &input)
                 continue;
             }
             if (msg.message == WM_KEYUP && msg.wParam == VK_SPACE && msg.hwnd != g_mute_button) continue;
-            if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { g_running = false; break; }
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_F11) {
+                if (!(msg.lParam & (1LL << 30))) ToggleFullscreen();
+                continue;
+            }
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+                if (g_fullscreen) ToggleFullscreen(); else { g_running = false; break; }
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1750,6 +1815,7 @@ static int PlayVideo(const std::wstring &input)
 
 static void CleanupPlayback()
 {
+    if (g_fullscreen) ToggleFullscreen();
     Log("cleanup: subprocesses");
     g_audio_done = true;
     if (g_ffproc) { TerminateProcess(g_ffproc, 0); WaitForSingleObject(g_ffproc, 2000); CloseHandle(g_ffproc); g_ffproc = nullptr; }
@@ -1840,8 +1906,10 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'S') { ToggleComparison(); continue; }
             if (message.wParam == 'D') { ToggleNR(); continue; }
             if (message.wParam == 'M') { CycleModel(); continue; }
+            if (message.wParam == VK_F11) { ToggleFullscreen(); continue; }
             if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider) { RequestFrameStep(-1); continue; }
             if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider) { RequestFrameStep(1); continue; }
+            if (message.wParam == VK_ESCAPE && g_fullscreen) { ToggleFullscreen(); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
