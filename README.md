@@ -21,6 +21,8 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 
 Windows 10/11 x64 and a Direct3D 12 GPU are required. The player selects a runtime from the **actual DXGI adapter used for rendering**; the `--gpu N` option selects a DXGI adapter index. On non-RTX 40/50 adapters, it skips NGX initialization and plays the original video with DLSS 5 and comparison controls disabled.
 
+If an RTX 40/50 adapter is detected but its NGX or DLSS NR runtime is missing or cannot initialize, the player also falls back to original-only playback instead of stopping with an `NGX failed` error.
+
 | GPU | Runtime | Validation |
 |---|---|---|
 | RTX 50 series | Original Blackwell NR DLL | Playback tested on RTX 5090 |

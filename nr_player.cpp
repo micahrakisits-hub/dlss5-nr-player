@@ -149,6 +149,7 @@ static UINT64                           g_sync_value = 0;
 
 static NVSDK_NGX_Parameter *g_params = nullptr;
 static NVSDK_NGX_Handle    *g_feature = nullptr;
+static bool                 g_ngx_initialized = false;
 
 static ComPtr<ID3D12Resource> g_y_tex;       // R8_UNORM Y plane (W x H)
 static ComPtr<ID3D12Resource> g_uv_tex;      // R8G8_UNORM UV plane (W/2 x H/2)
@@ -425,6 +426,7 @@ static bool SetupNGX(UINT w, UINT h)
         if (r == NGX_SUCCESS) { Log("core Init_ProjectID ver=0x%02X ok", ver); inited = 1; }
     }
     if (!inited) { Log("FAIL: Init_ProjectID"); return false; }
+    g_ngx_initialized = true;
 
     if (g_direct_init && g_shim_init)
     {
@@ -480,6 +482,27 @@ static bool SetupNGX(UINT w, UINT h)
     Log("NR feature created, handle=%p", g_feature);
     ExecuteAndWait();
     return true;
+}
+
+static void ReleaseNGXObjects()
+{
+    if (g_feature && g_nr_release)
+    {
+        if (g_shim_release) g_shim_release((void *)g_nr_release, g_feature);
+        else if (g_release) g_release(g_feature);
+    }
+    g_feature = nullptr;
+
+    if (g_params && g_core_module)
+    {
+        auto destroy = (NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter *))GetProcAddress(
+            g_core_module, "NVSDK_NGX_D3D12_DestroyParameters");
+        if (destroy) destroy(g_params);
+    }
+    g_params = nullptr;
+
+    if (g_ngx_initialized && g_shutdown) g_shutdown();
+    g_ngx_initialized = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,7 +1403,17 @@ static int PlayVideo(const std::wstring &input)
                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_staging))))
         Fatal("staging failed");
 
-    if (g_nr_available && !SetupNGX(g_vid_w, g_vid_h)) Fatal("NGX failed");
+    if (g_nr_available && !SetupNGX(g_vid_w, g_vid_h))
+    {
+        // SetupNGX starts with an open command list. Close and discard it so
+        // RenderFrame can reset the list normally for original-only playback.
+        g_list->Close();
+        ReleaseNGXObjects();
+        g_nr_available = false;
+        g_nr_enabled = false;
+        g_side = false;
+        Log("NGX setup failed; continuing with original video rendering");
+    }
     if (!SetupCompute()) Fatal("compute failed");
     g_media_loaded = true;
     if (!SetupWindow(g_vid_w, g_vid_h)) Fatal("window failed");
@@ -1421,7 +1454,8 @@ static int PlayVideo(const std::wstring &input)
         Log("encoding to %ls (crf %d)", g_output.c_str(), g_crf);
     }
 
-    Log("playing (ESC to stop). NR on GPU %d.", g_gpu_index < 0 ? 0 : g_gpu_index);
+    Log("playing (ESC to stop). %s on GPU %d.",
+        g_nr_available ? "DLSS 5 NR" : "Original video", g_gpu_index < 0 ? 0 : g_gpu_index);
 
     std::vector<uint8_t> frame((size_t)g_vid_w * g_vid_h * 3 / 2); // NV12: Y + interleaved UV
     std::vector<uint8_t> rgba_tight;
@@ -1571,18 +1605,7 @@ static void CleanupPlayback()
     if (g_audio_read) { CloseHandle(g_audio_read); g_audio_read = nullptr; }
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) if (g_fence[i]) WaitFence(g_fence[i].Get(), g_fence_value[i]);
     Log("cleanup: feature");
-    if (g_feature && g_nr_release) {
-        if (g_shim_release) g_shim_release((void *)g_nr_release, g_feature); else g_release(g_feature);
-    }
-    g_feature = nullptr;
-    Log("cleanup: parameters");
-    if (g_params && g_core_module) {
-        auto destroy = (NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter *))GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_DestroyParameters");
-        if (destroy) destroy(g_params);
-    }
-    g_params = nullptr;
-    Log("cleanup: shutdown");
-    if (g_shutdown && g_core_module) g_shutdown();
+    ReleaseNGXObjects();
     Log("cleanup: resources");
     g_swap.Reset(); g_readback.Reset();
     g_pso_in.Reset(); g_pso_out.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
