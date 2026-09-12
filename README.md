@@ -18,15 +18,15 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 
 ## Hardware and validation
 
-Windows 10/11 x64 and a GeForce RTX 40- or RTX 50-series GPU are required. The player selects a runtime from the **actual DXGI adapter used for rendering**; the `--gpu N` option selects a DXGI adapter index.
+Windows 10/11 x64 and a Direct3D 12 GPU are required. The player selects a runtime from the **actual DXGI adapter used for rendering**; the `--gpu N` option selects a DXGI adapter index. On non-RTX 40/50 adapters, it skips NGX initialization and plays the original video with DLSS 5 and comparison controls disabled.
 
 | GPU | Runtime | Validation |
 |---|---|---|
 | RTX 50 series | Original Blackwell NR DLL | Playback tested on RTX 5090 |
 | RTX 40 series, including Ti/Super | Community Ada patch from NR-Media-UI | Selection and packaging tested; actual RTX 40 playback/performance not verified here |
-| Other GPU families | Unsupported | No runtime selected |
+| Other Direct3D 12 GPUs | Original video only | DLSS 5 is disabled; no NVIDIA runtime is loaded |
 
-The RTX40 release README specifies NVIDIA driver **616.56 or newer** and describes its runtime as experimental. Compatibility and real-time performance must be checked on the target card. DLSS-off mode skips neural evaluation, but opening a video still initializes the NGX feature; it is not a fallback for unsupported GPUs.
+The RTX40 release README specifies NVIDIA driver **616.56 or newer** and describes its runtime as experimental. Compatibility and real-time performance must be checked on the target card. On supported RTX cards, DLSS-off mode skips neural evaluation after the NGX feature is initialized. Other Direct3D 12 GPUs use the original-only fallback and do not initialize NGX.
 
 ## Build the native player
 
@@ -42,7 +42,7 @@ Other build scripts and the DX11 bridge are retained from upstream. They are sep
 
 ## Runtime files to supply locally
 
-Place these files relative to `nr_player.exe`:
+Place these files relative to `nr_player.exe`. Original-only playback requires only FFmpeg and FFprobe; the NVIDIA files are needed when DLSS 5 is available:
 
 | Path | Source / purpose |
 |---|---|
@@ -50,7 +50,7 @@ Place these files relative to `nr_player.exe`:
 | `nvngx_dlssnr.dll` | Original RTX50 NR runtime from a legitimate DLSS5 application or the original NR-Media-UI RTX50 release |
 | `runtime40/nvngx_dlssnr.dll` | Community Ada runtime from the author's [NR-Media-UI v1.1.0 RTX40 release](https://github.com/perseval-BLR/NR-Media-UI/releases/tag/v1.1.0) |
 | `caller/nvngx.dll` | Caller wrapper from NR-Media-UI; its PyInstaller executable embeds this helper. It must export `DLSSNR_CallInit`, `DLSSNR_CallCreate`, `DLSSNR_CallEvaluate`, and `DLSSNR_CallRelease`. The driver's ordinary `nvngx.dll` is not a substitute. |
-| `ffmpeg.exe`, `ffprobe.exe` | FFmpeg build with CUDA decoding support, available through [FFmpeg's download page](https://ffmpeg.org/download.html). Native use can also resolve these from PATH. |
+| `ffmpeg.exe`, `ffprobe.exe` | FFmpeg, available through [FFmpeg's download page](https://ffmpeg.org/download.html). CUDA decoding is used on NVIDIA adapters when supported; other adapters use normal software decoding. Native use can also resolve these from PATH. |
 
 The two NR runtimes stay separate; the original RTX50 file is not overwritten with the patch. The selected DLL path is logged. `nvngx_dlss.dll` (Super Resolution) is not used by this player, although the upstream DX11 bridge uses it.
 
@@ -99,7 +99,7 @@ python build_portable.py
 
 The result is `dist/DLSS 5 NR Player.exe`. `--dist-dir PATH` selects another output directory. Paths resolve relative to the packaging script, so it can be invoked from another working directory. The script reports missing dependencies and does not download them automatically.
 
-The portable launcher extracts its payload to a temporary directory, launches the native GUI without a console, and waits until it closes before cleanup. No installed Python, FFmpeg, or source checkout is needed on the target computer. A compatible GPU and driver are still necessary. Diagnostics are written to `%TEMP%\DLSS5-NR-Player.log`.
+The portable launcher extracts its payload to a temporary directory, launches the native GUI without a console, and waits until it closes before cleanup. No installed Python, FFmpeg, or source checkout is needed on the target computer. A Direct3D 12-compatible GPU and driver are still necessary. Diagnostics are written to `%TEMP%\DLSS5-NR-Player.log`.
 
 The packaging recipe is for your local dependencies. Check the applicable licenses before sharing a package containing NVIDIA or other third-party binaries. This fork does not publish those binaries.
 

@@ -171,6 +171,7 @@ static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
 static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
 static NRRuntime g_runtime = NRRuntime::Unsupported;
+static bool g_nr_available = true;
 static std::wstring g_runtime_directory;
 static bool g_paused = false;
 static SRWLOCK g_audio_lock = SRWLOCK_INIT;
@@ -180,6 +181,7 @@ static UINT g_vid_w = 0, g_vid_h = 0;
 static UINT g_row_pitch = 0;
 static double g_fps = 30.0;
 static int  g_gpu_index = -1;
+static bool g_cuda_decode = false;
 static std::string g_style = "natural";
 static int  g_preset = 3, g_intensity = 1, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
 static bool g_fast = false;
@@ -285,10 +287,16 @@ static bool CreateDevice()
     if (!chosen) { Log("FAIL: selected GPU is not available"); return false; }
     DXGI_ADAPTER_DESC1 selectedDesc = {};
     chosen->GetDesc1(&selectedDesc);
+    g_cuda_decode = selectedDesc.VendorId == 0x10DE;
     g_runtime = RuntimeForAdapter(selectedDesc.VendorId, selectedDesc.Description);
-    if (g_runtime == NRRuntime::Unsupported)
-        Fatal("This build requires a GeForce RTX 40-series or RTX 50-series GPU.");
-    if (FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dev))))
+    g_nr_available = g_runtime != NRRuntime::Unsupported;
+    if (!g_nr_available)
+    {
+        g_nr_enabled = false;
+        g_side = false;
+        Log("DLSS 5 NR is unavailable on this adapter; continuing with original video rendering");
+    }
+    if (FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_dev))))
         { Log("FAIL: D3D12CreateDevice"); return false; }
     Log("D3D12 adapter: index %d", sel);
 
@@ -574,25 +582,29 @@ static bool SetupCompute()
 // ---------------------------------------------------------------------------
 static void UpdateModeTitle()
 {
-    const wchar_t *mode = g_side ? L"Original | DLSS 5" :
-                         (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original");
+    const wchar_t *mode = !g_nr_available ? L"Original (DLSS 5 unavailable)" :
+                         (g_side ? L"Original | DLSS 5" :
+                         (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original"));
     std::wstring title = L"DLSS5 NR player - ";
     title += mode;
-    title += L"  [S: compare | D: DLSS on/off | Space: pause]";
+    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | Space: pause]" : L"  [Space: pause]";
     SetWindowTextW(g_hwnd, title.c_str());
-    SetWindowTextW(g_split_button, g_side ? L"Split: ON" : L"Split: OFF");
+    SetWindowTextW(g_split_button, !g_nr_available ? L"Split: N/A" : (g_side ? L"Split: ON" : L"Split: OFF"));
     SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
-    SetWindowTextW(g_dlss_button, (g_side || g_nr_enabled) ? L"DLSS 5: ON" : L"DLSS 5: OFF");
+    SetWindowTextW(g_dlss_button, !g_nr_available ? L"DLSS 5: N/A" : ((g_side || g_nr_enabled) ? L"DLSS 5: ON" : L"DLSS 5: OFF"));
     SendMessageW(g_dlss_button, BM_SETCHECK, (g_side || g_nr_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
-    EnableWindow(g_dlss_button, !g_side);
+    EnableWindow(g_split_button, g_nr_available);
+    EnableWindow(g_dlss_button, g_nr_available && !g_side);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_trackbar, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
-    Log("view: %s", g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original"));
+    Log("view: %s", !g_nr_available ? "Original (DLSS 5 unavailable)" :
+         (g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original")));
 }
 
 static void ToggleComparison()
 {
+    if (!g_nr_available) return;
     if (!g_swap) { g_side = !g_side; UpdateModeTitle(); return; }
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
         WaitFence(g_fence[i].Get(), g_fence_value[i]);
@@ -608,6 +620,7 @@ static void ToggleComparison()
 
 static void ToggleNR()
 {
+    if (!g_nr_available) return;
     if (g_side) return; // comparison always shows original alongside NR
     g_nr_enabled = !g_nr_enabled;
     g_nr_reset = true;
@@ -854,7 +867,8 @@ static std::string RunCapture(const std::wstring &cmdline)
 // spawn ffmpeg with stdout piped; returns the read handle (or NULL)
 static HANDLE SpawnFfmpeg(const std::wstring &input, double seek, HANDLE *proc)
 {
-    std::wstring cmdline = L"ffmpeg -hide_banner -loglevel error -hwaccel cuda ";
+    std::wstring cmdline = L"ffmpeg -hide_banner -loglevel error ";
+    if (g_cuda_decode) cmdline += L"-hwaccel cuda ";
     if (seek > 0) { wchar_t b[64]; swprintf_s(b, L"-ss %.3f ", seek); cmdline += b; }
     cmdline += L"-i \"" + input + L"\" -an -f rawvideo -pix_fmt nv12 -";
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
@@ -1142,7 +1156,7 @@ static void RenderFrame(const uint8_t *nv12)
     bars[nb++] = Trans(g_nr_in.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_list->ResourceBarrier(nb, bars);
 
-    bool useNR = g_side || g_nr_enabled;
+    bool useNR = g_nr_available && (g_side || g_nr_enabled);
     if (useNR) {
         g_params->Set("DLSSNR.Reset", (g_frame_index == 0 || g_nr_reset) ? 1 : 0);
         NVSDK_NGX_Result re;
@@ -1329,7 +1343,7 @@ static int PlayVideo(const std::wstring &input)
                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_staging))))
         Fatal("staging failed");
 
-    if (!SetupNGX(g_vid_w, g_vid_h)) Fatal("NGX failed");
+    if (g_nr_available && !SetupNGX(g_vid_w, g_vid_h)) Fatal("NGX failed");
     if (!SetupCompute()) Fatal("compute failed");
     g_media_loaded = true;
     if (!SetupWindow(g_vid_w, g_vid_h)) Fatal("window failed");
