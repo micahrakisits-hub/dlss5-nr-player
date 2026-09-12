@@ -8,6 +8,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 
 - Start with an empty player, then use **File → Open**, **Ctrl+O**, or drop a video onto the window.
 - Open **Help → Keyboard Shortcuts** to see all keyboard controls in the player.
+- Choose **View → Theme → Light** or **Dark** to switch the complete player appearance. The refreshed interface uses rounded buttons, clearer active states, modern typography, and restyled sliders.
 - Open another video in the same window. After playback ends, the window stays available for another file.
 - Pause/resume video and audio by clicking the video, using the button, or pressing **Space**.
 - Use the **Fullscreen** button or **F11** for fullscreen playback. Press **Esc** or **F11** to return to the normal window.
@@ -43,7 +44,7 @@ Install Visual Studio Build Tools with **Desktop development with C++** and a Wi
 build_player.bat
 ```
 
-This produces `nr_player.exe`. The player declares its NGX interface inline, so **NVIDIA SDK headers are not required to compile this target**. The compiler links Windows D3D12, DXGI, D3DCompiler, User32, GDI32, WinMM, Common Controls, Common Dialogs, and Shell32 libraries.
+This produces `nr_player.exe`. The player declares its NGX interface inline, so **NVIDIA SDK headers are not required to compile this target**. The compiler links Windows D3D12, DXGI, D3DCompiler, User32, GDI32, WinMM, Common Controls, Common Dialogs, Shell32, DWM, and Windows theme libraries.
 
 Other build scripts and the DX11 bridge are retained from upstream. They are separate experiments and may have different prerequisites or paths.
 

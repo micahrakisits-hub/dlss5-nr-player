@@ -10,13 +10,22 @@ int main()
     assert(SetupWindow(960, 540));
     ShowWindow(g_hwnd, SW_HIDE);
     HMENU appMenu = GetMenu(g_hwnd);
-    assert(appMenu && GetMenuItemCount(appMenu) == 2);
-    HMENU helpMenu = GetSubMenu(appMenu, 1);
+    assert(appMenu && GetMenuItemCount(appMenu) == 3);
+    HMENU viewMenu = GetSubMenu(appMenu, 1);
+    HMENU themeMenu = viewMenu ? GetSubMenu(viewMenu, 0) : nullptr;
+    assert(themeMenu && GetMenuState(themeMenu, ID_THEME_DARK, MF_BYCOMMAND) & MF_CHECKED);
+    WndProc(g_hwnd, WM_COMMAND, ID_THEME_LIGHT, 0);
+    assert(!g_dark_theme && GetMenuState(themeMenu, ID_THEME_LIGHT, MF_BYCOMMAND) & MF_CHECKED);
+    WndProc(g_hwnd, WM_COMMAND, ID_THEME_DARK, 0);
+    assert(g_dark_theme && GetMenuState(themeMenu, ID_THEME_DARK, MF_BYCOMMAND) & MF_CHECKED);
+    HMENU helpMenu = GetSubMenu(appMenu, 2);
     assert(helpMenu && GetMenuState(helpMenu, ID_HELP_SHORTCUTS, MF_BYCOMMAND) != (UINT)-1);
     assert(std::wcsstr(HOTKEY_HELP_TEXT, L"Ctrl+O") &&
         std::wcsstr(HOTKEY_HELP_TEXT, L"Space") &&
         std::wcsstr(HOTKEY_HELP_TEXT, L"F11") &&
         std::wcsstr(HOTKEY_HELP_TEXT, L"Esc"));
+    assert(g_ui_font);
+    assert((GetWindowLongPtrW(g_pause_button, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
     assert(g_volume == 100 && !g_muted);
     SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, 35);
     WndProc(g_hwnd, WM_HSCROLL, TB_THUMBTRACK, (LPARAM)g_volume_slider);
@@ -129,5 +138,5 @@ int main()
     assert(GetMenu(g_hwnd) == windowedMenu);
     for (HWND control : controls) assert(GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE);
     DestroyWindow(g_hwnd);
-    puts("PASS: playback controls, help menu, reversible layout, aspect-ratio fitting, and fullscreen restore");
+    puts("PASS: themed controls, theme/help menus, playback controls, reversible layout, aspect-ratio fitting, and fullscreen restore");
 }
