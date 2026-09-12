@@ -829,6 +829,8 @@ static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT 
 
 static void LayoutControls(HWND hwnd)
 {
+    const int muteWidth = 70, volumeLabelWidth = 100, volumeSliderWidth = 110;
+    const int audioWidth = muteWidth + 6 + volumeLabelWidth + 6 + volumeSliderWidth;
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
     struct Control { HWND window; int width; };
@@ -844,7 +846,7 @@ static void LayoutControls(HWND hwnd)
     };
     POINT positions[6];
     for (int i = 0; i < 6; ++i) positions[i] = place(buttons[i].width);
-    POINT audio = place(280);
+    POINT audio = place(audioWidth);
     int seekY = (row + 1) * 36 + 6;
     int videoHeight = std::max(1, height - (seekY + 34));
     UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
@@ -858,9 +860,11 @@ static void LayoutControls(HWND hwnd)
     for (int i = 0; i < 6; ++i)
         placements[count++] = {buttons[i].window, positions[i].x,
             videoHeight + positions[i].y, buttons[i].width, 28};
-    placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, 70, 28};
-    placements[count++] = {g_volume_label, audio.x + 76, videoHeight + audio.y + 6, 88, 22};
-    placements[count++] = {g_volume_slider, audio.x + 164, videoHeight + audio.y, 116, 28};
+    placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, muteWidth, 28};
+    placements[count++] = {g_volume_label, audio.x + muteWidth + 6,
+        videoHeight + audio.y + 6, volumeLabelWidth, 22};
+    placements[count++] = {g_volume_slider, audio.x + muteWidth + 6 + volumeLabelWidth + 6,
+        videoHeight + audio.y, volumeSliderWidth, 28};
     placements[count++] = {g_trackbar, 6, videoHeight + seekY, std::max(1, width - 12), 28};
 
     HDWP batch = BeginDeferWindowPos(count);

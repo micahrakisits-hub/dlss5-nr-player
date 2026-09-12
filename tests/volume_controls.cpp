@@ -32,6 +32,18 @@ int main()
     assert(waveOutGetVolume(g_wave_out, &volume) == MMSYSERR_NOERROR && volume == 0);
     SetVolume(100);
     assert(waveOutGetVolume(g_wave_out, &volume) == MMSYSERR_NOERROR && volume == 0xffffffff);
+    wchar_t volumeText[32];
+    GetWindowTextW(g_volume_label, volumeText, 32);
+    assert(std::wcscmp(volumeText, L"Volume: 100%") == 0);
+    HDC labelDC = GetDC(g_volume_label);
+    HFONT labelFont = (HFONT)SendMessageW(g_volume_label, WM_GETFONT, 0, 0);
+    HGDIOBJ oldFont = labelFont ? SelectObject(labelDC, labelFont) : nullptr;
+    SIZE volumeTextSize = {};
+    GetTextExtentPoint32W(labelDC, volumeText, (int)std::wcslen(volumeText), &volumeTextSize);
+    if (oldFont) SelectObject(labelDC, oldFont);
+    ReleaseDC(g_volume_label, labelDC);
+    RECT labelRect; GetClientRect(g_volume_label, &labelRect);
+    assert(volumeTextSize.cx <= labelRect.right - labelRect.left);
     waveOutClose(g_wave_out);
     g_wave_out = nullptr;
 
