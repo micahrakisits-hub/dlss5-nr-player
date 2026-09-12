@@ -9,6 +9,23 @@ int main()
     InitCommonControlsEx(&icc);
     assert(SetupWindow(960, 540));
     ShowWindow(g_hwnd, SW_HIDE);
+    HMENU appMenu = GetMenu(g_hwnd);
+    assert(appMenu && GetMenuItemCount(appMenu) == 3);
+    HMENU viewMenu = GetSubMenu(appMenu, 1);
+    HMENU themeMenu = viewMenu ? GetSubMenu(viewMenu, 0) : nullptr;
+    assert(themeMenu && GetMenuState(themeMenu, ID_THEME_DARK, MF_BYCOMMAND) & MF_CHECKED);
+    WndProc(g_hwnd, WM_COMMAND, ID_THEME_LIGHT, 0);
+    assert(!g_dark_theme && GetMenuState(themeMenu, ID_THEME_LIGHT, MF_BYCOMMAND) & MF_CHECKED);
+    WndProc(g_hwnd, WM_COMMAND, ID_THEME_DARK, 0);
+    assert(g_dark_theme && GetMenuState(themeMenu, ID_THEME_DARK, MF_BYCOMMAND) & MF_CHECKED);
+    HMENU helpMenu = GetSubMenu(appMenu, 2);
+    assert(helpMenu && GetMenuState(helpMenu, ID_HELP_SHORTCUTS, MF_BYCOMMAND) != (UINT)-1);
+    assert(std::wcsstr(HOTKEY_HELP_TEXT, L"Ctrl+O") &&
+        std::wcsstr(HOTKEY_HELP_TEXT, L"Space") &&
+        std::wcsstr(HOTKEY_HELP_TEXT, L"F11") &&
+        std::wcsstr(HOTKEY_HELP_TEXT, L"Esc"));
+    assert(g_ui_font);
+    assert((GetWindowLongPtrW(g_pause_button, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
     assert(g_volume == 100 && !g_muted);
     SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, 35);
     WndProc(g_hwnd, WM_HSCROLL, TB_THUMBTRACK, (LPARAM)g_volume_slider);
@@ -47,18 +64,27 @@ int main()
     waveOutClose(g_wave_out);
     g_wave_out = nullptr;
 
+    g_media_loaded = true;
+    g_paused = false;
+    assert(GetWindowLongPtrW(g_video_hwnd, GWL_STYLE) & SS_NOTIFY);
+    WndProc(g_hwnd, WM_COMMAND, MAKEWPARAM(0, STN_CLICKED), (LPARAM)g_video_hwnd);
+    assert(g_paused);
+    WndProc(g_hwnd, WM_COMMAND, MAKEWPARAM(0, STN_CLICKED), (LPARAM)g_video_hwnd);
+    assert(!g_paused);
+    g_media_loaded = false;
+
     HWND controls[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_dlss_button, g_model_button, g_mute_button,
-        g_volume_label, g_volume_slider, g_trackbar};
-    RECT initial[10], restored[10];
+        g_split_button, g_dlss_button, g_model_button, g_fullscreen_button,
+        g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+    RECT initial[11], restored[11];
     SetWindowPos(g_hwnd, nullptr, 0, 0, 960, 400, SWP_NOMOVE | SWP_NOZORDER);
     LayoutControls(g_hwnd);
-    for (int i = 0; i < 10; ++i) GetWindowRect(controls[i], &initial[i]);
+    for (int i = 0; i < 11; ++i) GetWindowRect(controls[i], &initial[i]);
     SetWindowPos(g_hwnd, nullptr, 0, 0, 320, 300, SWP_NOMOVE | SWP_NOZORDER);
     LayoutControls(g_hwnd);
     SetWindowPos(g_hwnd, nullptr, 0, 0, 960, 400, SWP_NOMOVE | SWP_NOZORDER);
     LayoutControls(g_hwnd);
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 11; ++i) {
         GetWindowRect(controls[i], &restored[i]);
         assert(EqualRect(&initial[i], &restored[i]));
     }
@@ -66,7 +92,7 @@ int main()
         SetWindowPos(g_hwnd, nullptr, 0, 0, width, 300, SWP_NOMOVE | SWP_NOZORDER);
         LayoutControls(g_hwnd);
         RECT client; GetClientRect(g_hwnd, &client);
-        for (int i = 0; i < 10; ++i) {
+        for (int i = 0; i < 11; ++i) {
             RECT a; GetWindowRect(controls[i], &a);
             MapWindowPoints(nullptr, g_hwnd, (POINT*)&a, 2);
             assert(a.left >= 0 && a.right <= client.right && a.top >= 0 && a.bottom <= client.bottom);
@@ -97,6 +123,20 @@ int main()
     LayoutControls(g_hwnd);
     GetWindowRect(g_video_hwnd, &player);
     assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 32) <= 32);
+    g_side = false;
+    DWORD windowedStyle = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+    HMENU windowedMenu = GetMenu(g_hwnd);
+    ToggleFullscreen();
+    assert(g_fullscreen);
+    assert(!(GetWindowLongPtrW(g_hwnd, GWL_STYLE) & WS_OVERLAPPEDWINDOW));
+    assert(GetMenu(g_hwnd) == nullptr);
+    for (HWND control : controls) assert(!(GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE));
+    WndProc(g_hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+    assert(!g_fullscreen);
+    DWORD restoredStyle = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+    assert((restoredStyle & WS_OVERLAPPEDWINDOW) == (windowedStyle & WS_OVERLAPPEDWINDOW));
+    assert(GetMenu(g_hwnd) == windowedMenu);
+    for (HWND control : controls) assert(GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE);
     DestroyWindow(g_hwnd);
-    puts("PASS: audio controls, reversible responsive layout, and aspect-ratio fitting");
+    puts("PASS: themed controls, theme/help menus, playback controls, reversible layout, aspect-ratio fitting, and fullscreen restore");
 }

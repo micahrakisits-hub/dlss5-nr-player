@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <d3d12.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 #include <stdexcept>
 #include "nr_runtime.h"
 
@@ -114,6 +116,20 @@ typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
 typedef NVSDK_NGX_Result (*PFN_Shutdown)(void);
 
 static const int NR_FEATURE_ID = 18;
+static const UINT ID_FILE_OPEN = 1001;
+static const UINT ID_FILE_EXIT = 1002;
+static const UINT ID_HELP_SHORTCUTS = 1003;
+static const UINT ID_THEME_LIGHT = 1010;
+static const UINT ID_THEME_DARK = 1011;
+static const wchar_t HOTKEY_HELP_TEXT[] =
+    L"Ctrl+O\tOpen a video\r\n"
+    L"Space\tPause or resume\r\n"
+    L"Left / Right\tPrevious or next frame\r\n"
+    L"S\tToggle split comparison\r\n"
+    L"D\tToggle DLSS 5\r\n"
+    L"M\tCycle DLSS 5 model\r\n"
+    L"F11\tToggle fullscreen\r\n"
+    L"Esc\tExit fullscreen or close the player";
 
 // ---------------------------------------------------------------------------
 // globals
@@ -170,6 +186,7 @@ static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
 static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
+static HWND g_fullscreen_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
 static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
@@ -181,6 +198,16 @@ static SRWLOCK g_audio_lock = SRWLOCK_INIT;
 static HWAVEOUT g_wave_out = nullptr;
 static int g_volume = 100;
 static bool g_muted = false;
+static bool g_fullscreen = false;
+static DWORD g_windowed_style = 0;
+static WINDOWPLACEMENT g_windowed_placement = {sizeof(WINDOWPLACEMENT)};
+static HMENU g_windowed_menu = nullptr;
+static HMENU g_theme_menu = nullptr;
+static HFONT g_ui_font = nullptr;
+static HBRUSH g_background_brush = nullptr;
+static HBRUSH g_video_brush = nullptr;
+static bool g_dark_theme = true;
+static HWND g_hover_button = nullptr;
 
 static UINT g_vid_w = 0, g_vid_h = 0;
 static UINT g_row_pitch = 0;
@@ -625,15 +652,232 @@ static bool SetupCompute()
 // ---------------------------------------------------------------------------
 // window + swapchain (RGBA8)
 // ---------------------------------------------------------------------------
+struct ThemeColors
+{
+    COLORREF background, surface, button, buttonHover, border;
+    COLORREF text, mutedText, accent, accentHover;
+};
+
+static ThemeColors CurrentThemeColors()
+{
+    if (g_dark_theme) return {
+        RGB(18, 20, 24), RGB(27, 30, 36), RGB(39, 43, 51), RGB(50, 55, 65),
+        RGB(66, 72, 84), RGB(241, 244, 248), RGB(151, 158, 170),
+        RGB(75, 113, 255), RGB(91, 127, 255)};
+    return {
+        RGB(242, 244, 248), RGB(255, 255, 255), RGB(255, 255, 255), RGB(244, 247, 252),
+        RGB(205, 210, 220), RGB(30, 35, 44), RGB(102, 110, 124),
+        RGB(51, 94, 234), RGB(67, 108, 241)};
+}
+
+static bool IsButtonActive(HWND button)
+{
+    return (button == g_pause_button && g_paused) ||
+        (button == g_split_button && g_side) ||
+        (button == g_dlss_button && g_nr_available && (g_side || g_nr_enabled)) ||
+        (button == g_mute_button && g_muted);
+}
+
+static void DrawModernButton(const DRAWITEMSTRUCT *draw)
+{
+    ThemeColors colors = CurrentThemeColors();
+    bool enabled = !(draw->itemState & ODS_DISABLED);
+    bool pressed = draw->itemState & ODS_SELECTED;
+    bool active = IsButtonActive(draw->hwndItem);
+    bool hovered = draw->hwndItem == g_hover_button;
+    COLORREF fill = active ? (hovered ? colors.accentHover : colors.accent) :
+        (hovered ? colors.buttonHover : colors.button);
+    if (pressed) fill = active ? colors.accentHover : colors.border;
+
+    HBRUSH background = CreateSolidBrush(colors.background);
+    FillRect(draw->hDC, &draw->rcItem, background);
+    DeleteObject(background);
+
+    RECT face = draw->rcItem;
+    InflateRect(&face, -1, -1);
+    HBRUSH faceBrush = CreateSolidBrush(fill);
+    HPEN borderPen = CreatePen(PS_SOLID, 1, active ? colors.accent : colors.border);
+    HGDIOBJ oldBrush = SelectObject(draw->hDC, faceBrush);
+    HGDIOBJ oldPen = SelectObject(draw->hDC, borderPen);
+    RoundRect(draw->hDC, face.left, face.top, face.right, face.bottom, 10, 10);
+    SelectObject(draw->hDC, oldPen);
+    SelectObject(draw->hDC, oldBrush);
+    DeleteObject(borderPen);
+    DeleteObject(faceBrush);
+
+    wchar_t text[128] = {};
+    GetWindowTextW(draw->hwndItem, text, 128);
+    SetBkMode(draw->hDC, TRANSPARENT);
+    SetTextColor(draw->hDC, enabled ? (active ? RGB(255, 255, 255) : colors.text) : colors.mutedText);
+    HFONT font = (HFONT)SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0);
+    HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
+    RECT label = face;
+    if (pressed) OffsetRect(&label, 0, 1);
+    DrawTextW(draw->hDC, text, -1, &label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (oldFont) SelectObject(draw->hDC, oldFont);
+
+    if ((draw->itemState & ODS_FOCUS) && enabled) {
+        RECT focus = face;
+        InflateRect(&focus, -3, -3);
+        HPEN focusPen = CreatePen(PS_DOT, 1, active ? RGB(255, 255, 255) : colors.accent);
+        oldPen = SelectObject(draw->hDC, focusPen);
+        oldBrush = SelectObject(draw->hDC, GetStockObject(NULL_BRUSH));
+        RoundRect(draw->hDC, focus.left, focus.top, focus.right, focus.bottom, 8, 8);
+        SelectObject(draw->hDC, oldBrush);
+        SelectObject(draw->hDC, oldPen);
+        DeleteObject(focusPen);
+    }
+}
+
+static void MeasureModernMenu(MEASUREITEMSTRUCT *measure)
+{
+    const wchar_t *text = (const wchar_t *)measure->itemData;
+    if (!text) {
+        measure->itemWidth = 12;
+        measure->itemHeight = 9;
+        return;
+    }
+    HDC dc = GetDC(g_hwnd);
+    HGDIOBJ oldFont = g_ui_font ? SelectObject(dc, g_ui_font) : nullptr;
+    SIZE size = {};
+    GetTextExtentPoint32W(dc, text, (int)wcslen(text), &size);
+    if (oldFont) SelectObject(dc, oldFont);
+    ReleaseDC(g_hwnd, dc);
+    measure->itemWidth = size.cx + (wcschr(text, L'\t') ? 54 : 24);
+    measure->itemHeight = 27;
+}
+
+static void DrawModernMenu(const DRAWITEMSTRUCT *draw)
+{
+    ThemeColors colors = CurrentThemeColors();
+    const wchar_t *text = (const wchar_t *)draw->itemData;
+    bool selected = draw->itemState & ODS_SELECTED;
+    HBRUSH brush = CreateSolidBrush(selected ? colors.buttonHover : colors.background);
+    FillRect(draw->hDC, &draw->rcItem, brush);
+    DeleteObject(brush);
+    if (!text) {
+        RECT line = draw->rcItem;
+        int y = (line.top + line.bottom) / 2;
+        HPEN pen = CreatePen(PS_SOLID, 1, colors.border);
+        HGDIOBJ oldPen = SelectObject(draw->hDC, pen);
+        MoveToEx(draw->hDC, line.left + 10, y, nullptr);
+        LineTo(draw->hDC, line.right - 8, y);
+        SelectObject(draw->hDC, oldPen);
+        DeleteObject(pen);
+        return;
+    }
+
+    SetBkMode(draw->hDC, TRANSPARENT);
+    SetTextColor(draw->hDC, (draw->itemState & ODS_DISABLED) ? colors.mutedText : colors.text);
+    HGDIOBJ oldFont = g_ui_font ? SelectObject(draw->hDC, g_ui_font) : nullptr;
+    RECT label = draw->rcItem;
+    label.left += 12;
+    label.right -= 12;
+    const wchar_t *tab = wcschr(text, L'\t');
+    if (tab) {
+        std::wstring left(text, tab);
+        UINT flags = DT_VCENTER | DT_SINGLELINE |
+            ((draw->itemState & ODS_NOACCEL) ? DT_HIDEPREFIX : 0);
+        DrawTextW(draw->hDC, left.c_str(), -1, &label, DT_LEFT | flags);
+        DrawTextW(draw->hDC, tab + 1, -1, &label, DT_RIGHT | flags);
+    } else {
+        if (draw->itemState & ODS_CHECKED) {
+            HBRUSH dot = CreateSolidBrush(colors.accent);
+            HGDIOBJ oldBrush = SelectObject(draw->hDC, dot);
+            HGDIOBJ oldPen = SelectObject(draw->hDC, GetStockObject(NULL_PEN));
+            Ellipse(draw->hDC, label.left, label.top + 9, label.left + 8, label.top + 17);
+            SelectObject(draw->hDC, oldPen);
+            SelectObject(draw->hDC, oldBrush);
+            DeleteObject(dot);
+            label.left += 14;
+        }
+        UINT flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+            ((draw->itemState & ODS_NOACCEL) ? DT_HIDEPREFIX : 0);
+        DrawTextW(draw->hDC, text, -1, &label, flags);
+    }
+    if (oldFont) SelectObject(draw->hDC, oldFont);
+}
+
+static void SetMenuBackgrounds(HMENU menu)
+{
+    if (!menu || !g_background_brush) return;
+    MENUINFO info = {sizeof(info), MIM_BACKGROUND};
+    info.hbrBack = g_background_brush;
+    SetMenuInfo(menu, &info);
+    int count = GetMenuItemCount(menu);
+    for (int i = 0; i < count; ++i)
+        SetMenuBackgrounds(GetSubMenu(menu, i));
+}
+
+static LRESULT CALLBACK ModernButtonProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                         UINT_PTR id, DWORD_PTR)
+{
+    switch (message) {
+    case WM_MOUSEMOVE:
+        if (g_hover_button != hwnd) {
+            HWND previous = g_hover_button;
+            g_hover_button = hwnd;
+            if (previous) InvalidateRect(previous, nullptr, TRUE);
+            InvalidateRect(hwnd, nullptr, TRUE);
+            TRACKMOUSEEVENT tracking = {sizeof(tracking), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tracking);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        if (g_hover_button == hwnd) g_hover_button = nullptr;
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    case WM_ENABLE:
+    case WM_SETTEXT:
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    case WM_NCDESTROY:
+        if (g_hover_button == hwnd) g_hover_button = nullptr;
+        RemoveWindowSubclass(hwnd, ModernButtonProc, id);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+
+static void ApplyTheme(bool dark)
+{
+    g_dark_theme = dark;
+    ThemeColors colors = CurrentThemeColors();
+    if (g_background_brush) DeleteObject(g_background_brush);
+    if (g_video_brush) DeleteObject(g_video_brush);
+    g_background_brush = CreateSolidBrush(colors.background);
+    g_video_brush = CreateSolidBrush(RGB(0, 0, 0));
+    if (g_theme_menu) CheckMenuRadioItem(g_theme_menu, ID_THEME_LIGHT, ID_THEME_DARK,
+        dark ? ID_THEME_DARK : ID_THEME_LIGHT, MF_BYCOMMAND);
+    if (g_hwnd) {
+        BOOL darkTitleBar = dark;
+        if (FAILED(DwmSetWindowAttribute(g_hwnd, 20, &darkTitleBar, sizeof(darkTitleBar))))
+            DwmSetWindowAttribute(g_hwnd, 19, &darkTitleBar, sizeof(darkTitleBar));
+        SetWindowTheme(g_hwnd, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        SetMenuBackgrounds(GetMenu(g_hwnd));
+    }
+    HWND themed[] = {g_volume_slider, g_trackbar};
+    for (HWND control : themed) if (control)
+        SetWindowTheme(control, L"", L"");
+    if (g_hwnd) {
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+            SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        DrawMenuBar(g_hwnd);
+        RedrawWindow(g_hwnd, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        for (HWND control : themed) if (control)
+            RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    }
+}
+
 static void UpdateModeTitle()
 {
     const wchar_t *mode = !g_nr_available ? L"Original (DLSS 5 unavailable)" :
                          (g_side ? L"Original | DLSS 5" :
                          (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original"));
-    std::wstring title = L"DLSS5 NR player - ";
+    std::wstring title = L"DLSS 5 NR Player  —  ";
     title += mode;
-    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | M: model | Left/Right: frame]" :
-                              L"  [Left/Right: frame | Space: pause]";
     SetWindowTextW(g_hwnd, title.c_str());
     SetWindowTextW(g_split_button, !g_nr_available ? L"Split: N/A" : (g_side ? L"Split: ON" : L"Split: OFF"));
     SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -649,6 +893,7 @@ static void UpdateModeTitle()
     EnableWindow(g_prev_frame_button, g_media_loaded);
     EnableWindow(g_next_frame_button, g_media_loaded);
     EnableWindow(g_trackbar, g_media_loaded);
+    EnableWindow(g_fullscreen_button, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
     Log("view: %s", !g_nr_available ? "Original (DLSS 5 unavailable)" :
          (g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original")));
@@ -827,45 +1072,88 @@ static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT 
     return result;
 }
 
+static void ToggleFullscreen()
+{
+    if (!g_hwnd || (!g_fullscreen && !g_media_loaded)) return;
+    if (!g_fullscreen) {
+        MONITORINFO monitor = {sizeof(monitor)};
+        if (!GetWindowPlacement(g_hwnd, &g_windowed_placement) ||
+            !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+        g_windowed_style = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+        g_windowed_menu = GetMenu(g_hwnd);
+        g_fullscreen = true;
+        SetMenu(g_hwnd, nullptr);
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, g_windowed_style & ~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(g_hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right - monitor.rcMonitor.left,
+            monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        g_fullscreen = false;
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, g_windowed_style);
+        SetMenu(g_hwnd, g_windowed_menu);
+        SetWindowPlacement(g_hwnd, &g_windowed_placement);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+            SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        DrawMenuBar(g_hwnd);
+    }
+    LayoutControls(g_hwnd);
+}
+
 static void LayoutControls(HWND hwnd)
 {
-    const int muteWidth = 70, volumeLabelWidth = 100, volumeSliderWidth = 110;
+    const int muteWidth = 70, volumeLabelWidth = 110, volumeSliderWidth = 100;
     const int audioWidth = muteWidth + 6 + volumeLabelWidth + 6 + volumeSliderWidth;
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
+    HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
+        g_split_button, g_dlss_button, g_model_button, g_fullscreen_button,
+        g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+    if (g_fullscreen) {
+        for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
+        UINT contentWidth = g_vid_w * (g_side ? 2u : 1u);
+        RECT video = FitVideoRect(width, height, contentWidth, g_vid_h);
+        SetWindowPos(g_video_hwnd, nullptr, video.left, video.top,
+            video.right - video.left, video.bottom - video.top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        return;
+    }
+    for (HWND control : chrome) if (control) ShowWindow(control, SW_SHOW);
     struct Control { HWND window; int width; };
     Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
         {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
-        {g_model_button, 130}};
-    int x = 6, row = 0;
+        {g_model_button, 130}, {g_fullscreen_button, 88}};
+    int x = 8, row = 0;
     auto place = [&](int controlWidth) {
-        if (x > 6 && x + controlWidth > width - 6) { x = 6; ++row; }
-        POINT pos = {x, row * 36 + 6};
+        if (x > 8 && x + controlWidth > width - 8) { x = 8; ++row; }
+        POINT pos = {x, row * 42 + 8};
         x += controlWidth + 6;
         return pos;
     };
-    POINT positions[6];
-    for (int i = 0; i < 6; ++i) positions[i] = place(buttons[i].width);
+    POINT positions[7];
+    for (int i = 0; i < 7; ++i) positions[i] = place(buttons[i].width);
     POINT audio = place(audioWidth);
-    int seekY = (row + 1) * 36 + 6;
-    int videoHeight = std::max(1, height - (seekY + 34));
+    int seekY = (row + 1) * 42 + 8;
+    int videoHeight = std::max(1, height - (seekY + 38));
     UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
     struct Placement { HWND window; int x, y, width, height; };
-    Placement placements[11];
+    Placement placements[12];
     int count = 0;
     placements[count++] = {g_video_hwnd, video.left, video.top,
         video.right - video.left, video.bottom - video.top};
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 7; ++i)
         placements[count++] = {buttons[i].window, positions[i].x,
-            videoHeight + positions[i].y, buttons[i].width, 28};
-    placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, muteWidth, 28};
+            videoHeight + positions[i].y, buttons[i].width, 34};
+    placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, muteWidth, 34};
     placements[count++] = {g_volume_label, audio.x + muteWidth + 6,
         videoHeight + audio.y + 6, volumeLabelWidth, 22};
     placements[count++] = {g_volume_slider, audio.x + muteWidth + 6 + volumeLabelWidth + 6,
-        videoHeight + audio.y, volumeSliderWidth, 28};
-    placements[count++] = {g_trackbar, 6, videoHeight + seekY, std::max(1, width - 12), 28};
+        videoHeight + audio.y, volumeSliderWidth, 34};
+    placements[count++] = {g_trackbar, 8, videoHeight + seekY, std::max(1, width - 16), 30};
 
     HDWP batch = BeginDeferWindowPos(count);
     for (int i = 0; batch && i < count; ++i)
@@ -899,16 +1187,107 @@ static void OpenVideoDialog(HWND hwnd)
     else if (wasPlaying) TogglePause();
 }
 
+static void ShowHotkeyHelp(HWND hwnd)
+{
+    MessageBoxW(hwnd, HOTKEY_HELP_TEXT, L"Keyboard Shortcuts", MB_OK | MB_ICONINFORMATION);
+}
+
+static LRESULT DrawModernTrackbar(NMCUSTOMDRAW *draw)
+{
+    ThemeColors colors = CurrentThemeColors();
+    if (draw->dwDrawStage == CDDS_PREPAINT) {
+        RECT client;
+        GetClientRect(draw->hdr.hwndFrom, &client);
+        FillRect(draw->hdc, &client, g_background_brush ? g_background_brush : GetSysColorBrush(COLOR_WINDOW));
+        return CDRF_NOTIFYITEMDRAW;
+    }
+    if (draw->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+    if (draw->dwItemSpec != TBCD_CHANNEL && draw->dwItemSpec != TBCD_THUMB)
+        return CDRF_SKIPDEFAULT;
+
+    RECT item = draw->rc;
+    COLORREF fill = draw->dwItemSpec == TBCD_THUMB ? colors.accent : colors.border;
+    int radius = draw->dwItemSpec == TBCD_THUMB ? 12 : 6;
+    if (draw->dwItemSpec == TBCD_CHANNEL) {
+        int center = (item.top + item.bottom) / 2;
+        item.top = center - 2;
+        item.bottom = center + 3;
+    }
+    HBRUSH brush = CreateSolidBrush(fill);
+    HGDIOBJ oldBrush = SelectObject(draw->hdc, brush);
+    HGDIOBJ oldPen = SelectObject(draw->hdc, GetStockObject(NULL_PEN));
+    RoundRect(draw->hdc, item.left, item.top, item.right, item.bottom, radius, radius);
+    SelectObject(draw->hdc, oldPen);
+    SelectObject(draw->hdc, oldBrush);
+    DeleteObject(brush);
+    return CDRF_SKIPDEFAULT;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m)
     {
+    case WM_ERASEBKGND:
+    {
+        HDC dc = (HDC)wp;
+        RECT client;
+        GetClientRect(hwnd, &client);
+        FillRect(dc, &client, g_background_brush ? g_background_brush : GetSysColorBrush(COLOR_WINDOW));
+        if (g_media_loaded || g_fullscreen) {
+            RECT videoArea = client;
+            if (!g_fullscreen && g_pause_button) {
+                RECT button;
+                GetWindowRect(g_pause_button, &button);
+                MapWindowPoints(nullptr, hwnd, (POINT *)&button, 2);
+                videoArea.bottom = std::max(0L, button.top - 8);
+            }
+            FillRect(dc, &videoArea, g_video_brush ? g_video_brush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        }
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC dc = (HDC)wp;
+        HWND control = (HWND)lp;
+        ThemeColors colors = CurrentThemeColors();
+        SetBkMode(dc, TRANSPARENT);
+        if (control == g_video_hwnd) {
+            SetTextColor(dc, g_dark_theme ? RGB(176, 182, 193) : RGB(205, 210, 220));
+            return (LRESULT)(g_video_brush ? g_video_brush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        }
+        SetTextColor(dc, colors.text);
+        return (LRESULT)(g_background_brush ? g_background_brush : GetSysColorBrush(COLOR_WINDOW));
+    }
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) {
+            DrawModernButton((DRAWITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        if (((DRAWITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
+            DrawModernMenu((DRAWITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        break;
+    case WM_MEASUREITEM:
+        if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
+            MeasureModernMenu((MEASUREITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        break;
+    case WM_NOTIFY:
+        if (((NMHDR *)lp)->code == NM_CUSTOMDRAW &&
+            (((NMHDR *)lp)->hwndFrom == g_volume_slider || ((NMHDR *)lp)->hwndFrom == g_trackbar))
+            return DrawModernTrackbar((NMCUSTOMDRAW *)lp);
+        break;
     case WM_SIZE: LayoutControls(hwnd); return 0;
     case WM_GETMINMAXINFO:
         ((MINMAXINFO *)lp)->ptMinTrackSize = {320, 300}; return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == 1001) { OpenVideoDialog(hwnd); return 0; }
-        if (LOWORD(wp) == 1002) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if (LOWORD(wp) == ID_FILE_OPEN) { OpenVideoDialog(hwnd); return 0; }
+        if (LOWORD(wp) == ID_FILE_EXIT) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if (LOWORD(wp) == ID_HELP_SHORTCUTS) { ShowHotkeyHelp(hwnd); return 0; }
+        if (LOWORD(wp) == ID_THEME_LIGHT) { ApplyTheme(false); return 0; }
+        if (LOWORD(wp) == ID_THEME_DARK) { ApplyTheme(true); return 0; }
         if ((HWND)lp == g_pause_button && HIWORD(wp) == BN_CLICKED) { TogglePause(); return 0; }
         if ((HWND)lp == g_prev_frame_button && HIWORD(wp) == BN_CLICKED) { RequestFrameStep(-1); return 0; }
         if ((HWND)lp == g_next_frame_button && HIWORD(wp) == BN_CLICKED) { RequestFrameStep(1); return 0; }
@@ -916,8 +1295,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
         if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
+        if ((HWND)lp == g_video_hwnd && HIWORD(wp) == STN_CLICKED) { TogglePause(); return 0; }
+        if ((HWND)lp == g_fullscreen_button && HIWORD(wp) == BN_CLICKED) { ToggleFullscreen(); return 0; }
         break;
-    case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_F11) { ToggleFullscreen(); return 0; }
+        if (wp == VK_ESCAPE) {
+            if (g_fullscreen) ToggleFullscreen(); else g_running = false;
+            return 0;
+        }
+        break;
     case WM_DROPFILES:
     {
         HDROP drop = (HDROP)wp;
@@ -946,7 +1333,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             return 0;
         }
         break;
-    case WM_CLOSE: case WM_DESTROY: g_running = false; PostQuitMessage(0); return 0;
+    case WM_CLOSE: g_running = false; DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        if (g_ui_font) { DeleteObject(g_ui_font); g_ui_font = nullptr; }
+        if (g_background_brush) { DeleteObject(g_background_brush); g_background_brush = nullptr; }
+        if (g_video_brush) { DeleteObject(g_video_brush); g_video_brush = nullptr; }
+        g_running = false;
+        PostQuitMessage(0);
+        return 0;
     }
     return DefWindowProcW(hwnd, m, wp, lp);
 }
@@ -973,32 +1367,46 @@ static bool SetupWindow(UINT w, UINT h)
                              CW_USEDEFAULT, CW_USEDEFAULT, std::min(r.right - r.left, work.right - work.left), std::min(r.bottom - r.top, work.bottom - work.top),
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) return false;
-    HMENU menu = CreateMenu(), file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, 1001, L"&Open...\tCtrl+O");
-    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, 1002, L"E&xit");
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)file, L"&File");
+    g_ui_font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HMENU menu = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu();
+    HMENU theme = CreatePopupMenu(), help = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING | MF_OWNERDRAW, ID_FILE_OPEN, L"&Open...\tCtrl+O");
+    AppendMenuW(file, MF_SEPARATOR | MF_OWNERDRAW, 0, nullptr);
+    AppendMenuW(file, MF_STRING | MF_OWNERDRAW, ID_FILE_EXIT, L"E&xit");
+    AppendMenuW(menu, MF_POPUP | MF_OWNERDRAW, (UINT_PTR)file, L"&File");
+    AppendMenuW(theme, MF_STRING | MF_OWNERDRAW, ID_THEME_LIGHT, L"&Light");
+    AppendMenuW(theme, MF_STRING | MF_OWNERDRAW, ID_THEME_DARK, L"&Dark");
+    AppendMenuW(view, MF_POPUP | MF_OWNERDRAW, (UINT_PTR)theme, L"&Theme");
+    AppendMenuW(menu, MF_POPUP | MF_OWNERDRAW, (UINT_PTR)view, L"&View");
+    AppendMenuW(help, MF_STRING | MF_OWNERDRAW, ID_HELP_SHORTCUTS, L"&Keyboard Shortcuts...");
+    AppendMenuW(menu, MF_POPUP | MF_OWNERDRAW, (UINT_PTR)help, L"&Help");
+    g_theme_menu = theme;
     SetMenu(g_hwnd, menu);
     DragAcceptFiles(g_hwnd, TRUE);
 
-    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+    DWORD buttonStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
+    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
                                   0, 0, dw, h, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+    g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", buttonStyle,
                                     0, 0, 72, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_prev_frame_button = CreateWindowExW(0, L"BUTTON", L"\x25C0 Frame", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+    g_prev_frame_button = CreateWindowExW(0, L"BUTTON", L"\x25C0", buttonStyle,
                                          0, 0, 64, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_next_frame_button = CreateWindowExW(0, L"BUTTON", L"Frame \x25B6", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+    g_next_frame_button = CreateWindowExW(0, L"BUTTON", L"\x25B6", buttonStyle,
                                          0, 0, 64, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    DWORD toggleStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_CHECKBOX | BS_PUSHLIKE;
+    DWORD toggleStyle = buttonStyle;
     g_split_button = CreateWindowExW(0, L"BUTTON", L"Split: OFF", toggleStyle,
                                     0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+    g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", buttonStyle,
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_fullscreen_button = CreateWindowExW(0, L"BUTTON", L"Full screen", buttonStyle,
+                                         0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE,
+    g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                     0, 0, 88, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_volume_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
                                      0, 0, 116, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
@@ -1012,14 +1420,21 @@ static bool SetupWindow(UINT w, UINT h)
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar ||
-        !g_mute_button || !g_volume_label || !g_volume_slider) return false;
+        !g_mute_button || !g_volume_label || !g_volume_slider || !g_fullscreen_button) return false;
+    HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
+        g_split_button, g_dlss_button, g_model_button, g_fullscreen_button,
+        g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+    for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    HWND buttons[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
+        g_split_button, g_dlss_button, g_model_button, g_fullscreen_button, g_mute_button};
+    for (HWND button : buttons) if (!SetWindowSubclass(button, ModernButtonProc, 2, 0)) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
+    ApplyTheme(true);
     LayoutControls(g_hwnd);
     }
 
     if (!g_dev) {
         SetWindowTextW(g_video_hwnd, L"Drop a video here, or choose File > Open");
-        SetWindowLongPtrW(g_video_hwnd, GWL_STYLE, GetWindowLongPtrW(g_video_hwnd, GWL_STYLE) | SS_CENTER);
         UpdateModeTitle();
         ShowWindow(g_hwnd, SW_SHOW);
         return true;
@@ -1643,7 +2058,14 @@ static int PlayVideo(const std::wstring &input)
                 continue;
             }
             if (msg.message == WM_KEYUP && msg.wParam == VK_SPACE && msg.hwnd != g_mute_button) continue;
-            if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { g_running = false; break; }
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_F11) {
+                if (!(msg.lParam & (1LL << 30))) ToggleFullscreen();
+                continue;
+            }
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+                if (g_fullscreen) ToggleFullscreen(); else { g_running = false; break; }
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1749,6 +2171,7 @@ static int PlayVideo(const std::wstring &input)
 
 static void CleanupPlayback()
 {
+    if (g_fullscreen) ToggleFullscreen();
     Log("cleanup: subprocesses");
     g_audio_done = true;
     if (g_ffproc) { TerminateProcess(g_ffproc, 0); WaitForSingleObject(g_ffproc, 2000); CloseHandle(g_ffproc); g_ffproc = nullptr; }
@@ -1839,8 +2262,10 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'S') { ToggleComparison(); continue; }
             if (message.wParam == 'D') { ToggleNR(); continue; }
             if (message.wParam == 'M') { CycleModel(); continue; }
+            if (message.wParam == VK_F11) { ToggleFullscreen(); continue; }
             if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider) { RequestFrameStep(-1); continue; }
             if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider) { RequestFrameStep(1); continue; }
+            if (message.wParam == VK_ESCAPE && g_fullscreen) { ToggleFullscreen(); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
