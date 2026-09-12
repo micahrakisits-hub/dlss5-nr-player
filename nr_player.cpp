@@ -169,6 +169,7 @@ static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
+static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
 static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
@@ -178,6 +179,8 @@ static std::wstring g_runtime_directory;
 static bool g_paused = false;
 static SRWLOCK g_audio_lock = SRWLOCK_INIT;
 static HWAVEOUT g_wave_out = nullptr;
+static int g_volume = 100;
+static bool g_muted = false;
 
 static UINT g_vid_w = 0, g_vid_h = 0;
 static UINT g_row_pitch = 0;
@@ -689,6 +692,41 @@ static void CycleModel()
     Log("DLSS 5 model: %s", g_style.c_str());
 }
 
+// Caller holds g_audio_lock so changing volume cannot race device replacement.
+static void ApplyVolumeLocked()
+{
+    if (!g_wave_out) return;
+    DWORD level = g_muted ? 0 : (DWORD)(g_volume * 65535 / 100);
+    waveOutSetVolume(g_wave_out, level | (level << 16));
+}
+
+static void UpdateVolumeControls()
+{
+    wchar_t label[32];
+    swprintf_s(label, L"Volume: %d%%", g_volume);
+    SetWindowTextW(g_volume_label, label);
+    SetWindowTextW(g_mute_button, g_muted ? L"Unmute" : L"Mute");
+    SendMessageW(g_mute_button, BM_SETCHECK, g_muted ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+static void SetVolume(int volume)
+{
+    AcquireSRWLockExclusive(&g_audio_lock);
+    g_volume = std::max(0, std::min(100, volume));
+    ApplyVolumeLocked();
+    ReleaseSRWLockExclusive(&g_audio_lock);
+    UpdateVolumeControls();
+}
+
+static void ToggleMute()
+{
+    AcquireSRWLockExclusive(&g_audio_lock);
+    g_muted = !g_muted;
+    ApplyVolumeLocked();
+    ReleaseSRWLockExclusive(&g_audio_lock);
+    UpdateVolumeControls();
+}
+
 static void TogglePause()
 {
     if (!g_media_loaded) return;
@@ -773,17 +811,30 @@ static void LayoutControls(HWND hwnd)
 {
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
-    bool stacked = width < 780;
-    int videoHeight = std::max(1, height - (stacked ? 76 : 40));
+    struct Control { HWND window; int width; };
+    Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
+        {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
+        {g_model_button, 130}};
+    int x = 6, row = 0;
+    auto place = [&](int controlWidth) {
+        if (x > 6 && x + controlWidth > width - 6) { x = 6; ++row; }
+        POINT pos = {x, row * 36 + 6};
+        x += controlWidth + 6;
+        return pos;
+    };
+    POINT positions[6];
+    for (int i = 0; i < 6; ++i) positions[i] = place(buttons[i].width);
+    POINT audio = place(280);
+    int seekY = (row + 1) * 36 + 6;
+    int videoHeight = std::max(1, height - (seekY + 34));
     if (g_video_hwnd) MoveWindow(g_video_hwnd, 0, 0, width, videoHeight, TRUE);
-    if (g_pause_button) MoveWindow(g_pause_button, 6, videoHeight + 6, 72, 28, TRUE);
-    if (g_prev_frame_button) MoveWindow(g_prev_frame_button, 84, videoHeight + 6, 64, 28, TRUE);
-    if (g_next_frame_button) MoveWindow(g_next_frame_button, 154, videoHeight + 6, 64, 28, TRUE);
-    if (g_split_button) MoveWindow(g_split_button, 224, videoHeight + 6, 90, 28, TRUE);
-    if (g_dlss_button) MoveWindow(g_dlss_button, stacked ? 6 : 320, videoHeight + (stacked ? 42 : 6), 100, 28, TRUE);
-    if (g_model_button) MoveWindow(g_model_button, stacked ? 112 : 426, videoHeight + (stacked ? 42 : 6), 130, 28, TRUE);
-    int seekX = stacked ? 248 : 562;
-    if (g_trackbar) MoveWindow(g_trackbar, seekX, videoHeight + (stacked ? 42 : 6), std::max(1, width - seekX - 6), 28, TRUE);
+    for (int i = 0; i < 6; ++i)
+        if (buttons[i].window) MoveWindow(buttons[i].window, positions[i].x,
+            videoHeight + positions[i].y, buttons[i].width, 28, TRUE);
+    if (g_mute_button) MoveWindow(g_mute_button, audio.x, videoHeight + audio.y, 70, 28, TRUE);
+    if (g_volume_label) MoveWindow(g_volume_label, audio.x + 76, videoHeight + audio.y + 6, 88, 22, TRUE);
+    if (g_volume_slider) MoveWindow(g_volume_slider, audio.x + 164, videoHeight + audio.y, 116, 28, TRUE);
+    if (g_trackbar) MoveWindow(g_trackbar, 6, videoHeight + seekY, std::max(1, width - 12), 28, TRUE);
 }
 
 static void OpenVideoDialog(HWND hwnd)
@@ -808,7 +859,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     {
     case WM_SIZE: LayoutControls(hwnd); return 0;
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO *)lp)->ptMinTrackSize = {320, 200}; return 0;
+        ((MINMAXINFO *)lp)->ptMinTrackSize = {320, 300}; return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == 1001) { OpenVideoDialog(hwnd); return 0; }
         if (LOWORD(wp) == 1002) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
@@ -818,6 +869,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
+        if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
         break;
     case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
     case WM_DROPFILES:
@@ -830,6 +882,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_HSCROLL:
+        if ((HWND)lp == g_volume_slider) {
+            SetVolume((int)SendMessageW(g_volume_slider, TBM_GETPOS, 0, 0));
+            return 0;
+        }
         if ((HWND)lp == g_trackbar)
         {
             int pos = (int)SendMessageW(g_trackbar, TBM_GETPOS, 0, 0);
@@ -853,7 +909,7 @@ static bool SetupWindow(UINT w, UINT h)
 {
     if (!g_hwnd) {
     UINT dw = g_side ? w * 2 : w; // side-by-side doubles the width
-    const UINT TBH = 40;          // controls stay outside the video surface
+    const UINT TBH = 76;          // controls stay outside the video surface
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
@@ -893,12 +949,23 @@ static bool SetupWindow(UINT w, UINT h)
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
+                                   0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE,
+                                    0, 0, 88, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_volume_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                     0, 0, 116, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    SendMessageW(g_volume_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(g_volume_slider, TBM_SETPAGESIZE, 0, 10);
+    SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, g_volume);
+    UpdateVolumeControls();
     // seek bar (child trackbar at the bottom)
     g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
-        !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar) return false;
+        !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar ||
+        !g_mute_button || !g_volume_label || !g_volume_slider) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
     LayoutControls(g_hwnd);
     }
@@ -1079,6 +1146,7 @@ static DWORD WINAPI AudioThread(LPVOID)
         { g_audio_done = true; return 0; }
     AcquireSRWLockExclusive(&g_audio_lock);
     g_wave_out = hwo;
+    ApplyVolumeLocked();
     if (g_paused) waveOutPause(hwo);
     ReleaseSRWLockExclusive(&g_audio_lock);
 
@@ -1516,17 +1584,17 @@ static int PlayVideo(const std::wstring &input)
                 }
                 continue;
             }
-            if (msg.message == WM_KEYDOWN && msg.wParam == VK_SPACE)
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_SPACE && msg.hwnd != g_mute_button)
             {
                 if (!(msg.lParam & (1LL << 30))) TogglePause();
                 continue;
             }
-            if (msg.message == WM_KEYDOWN && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
+            if (msg.message == WM_KEYDOWN && msg.hwnd != g_volume_slider && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
             {
                 if (!(msg.lParam & (1LL << 30))) RequestFrameStep(msg.wParam == VK_LEFT ? -1 : 1);
                 continue;
             }
-            if (msg.message == WM_KEYUP && msg.wParam == VK_SPACE) continue;
+            if (msg.message == WM_KEYUP && msg.wParam == VK_SPACE && msg.hwnd != g_mute_button) continue;
             if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { g_running = false; break; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -1722,8 +1790,8 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'S') { ToggleComparison(); continue; }
             if (message.wParam == 'D') { ToggleNR(); continue; }
             if (message.wParam == 'M') { CycleModel(); continue; }
-            if (message.wParam == VK_LEFT) { RequestFrameStep(-1); continue; }
-            if (message.wParam == VK_RIGHT) { RequestFrameStep(1); continue; }
+            if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider) { RequestFrameStep(-1); continue; }
+            if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider) { RequestFrameStep(1); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
