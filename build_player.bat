@@ -16,5 +16,5 @@ if not exist "%VCVARS64%" (
 )
 call "%VCVARS64%"
 if errorlevel 1 exit /b 1
-cl /nologo /EHsc /O2 /MT nr_player.cpp /link /OUT:nr_player.exe d3d12.lib dxgi.lib d3dcompiler.lib user32.lib winmm.lib comctl32.lib comdlg32.lib shell32.lib
+cl /nologo /EHsc /O2 /MT nr_player.cpp /link /OUT:nr_player.exe d3d12.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib winmm.lib comctl32.lib comdlg32.lib shell32.lib dwmapi.lib uxtheme.lib
 exit /b %errorlevel%
